@@ -14,9 +14,7 @@ import sys
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Sync test dependencies (stub)")
-    parser.add_argument(
-        "--fix", action="store_true", help="Auto-fix missing dependencies"
-    )
+    parser.add_argument("--fix", action="store_true", help="Auto-fix missing dependencies")
     parser.add_argument("--verify", action="store_true", help="Verify dependencies")
     parser.parse_args()
 
