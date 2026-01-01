@@ -1,4 +1,5 @@
 """Tests for script execution as __main__."""
+
 import subprocess
 import sys
 from pathlib import Path
@@ -12,7 +13,7 @@ def test_sync_test_dependencies_as_script() -> None:
         text=True,
         cwd=Path(__file__).parent.parent,
     )
-    
+
     assert result.returncode == 0
     assert "✅" in result.stdout
 
@@ -25,7 +26,7 @@ def test_sync_tool_versions_as_script() -> None:
         text=True,
         cwd=Path(__file__).parent.parent,
     )
-    
+
     assert result.returncode == 0
     assert "✅" in result.stdout
 
@@ -39,6 +40,6 @@ def test_resolve_mypy_pin_as_script() -> None:
         env={"MATRIX_PYTHON_VERSION": "3.11"},
         cwd=Path(__file__).parent.parent,
     )
-    
+
     assert result.returncode == 0
     assert "python-version=3.11" in result.stdout
