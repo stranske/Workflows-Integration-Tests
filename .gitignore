@@ -4,3 +4,8 @@ __pycache__/
 .DS_Store
 .coverage*
 artifacts/
+
+# Build artifacts
+*.egg-info/
+coverage.json
+htmlcov/
