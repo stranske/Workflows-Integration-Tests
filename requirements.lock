@@ -12,7 +12,7 @@ coverage==7.13.1
     # via pytest-cov
 iniconfig==2.3.0
     # via pytest
-librt==0.7.7 ; platform_python_implementation != 'PyPy'
+librt==0.7.8 ; platform_python_implementation != 'PyPy'
     # via mypy
 mypy==1.19.1
     # via workflows-integration (pyproject.toml)
@@ -44,7 +44,7 @@ pytest-cov==7.0.0
     # via workflows-integration (pyproject.toml)
 pytokens==0.3.0
     # via black
-ruff==0.14.11
+ruff==0.14.12
     # via workflows-integration (pyproject.toml)
 tomli==2.4.0 ; python_full_version <= '3.11'
     # via coverage
