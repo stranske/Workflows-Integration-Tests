@@ -1,187 +1,148 @@
-# CLAUDE.md - Integration Test Repository
+# CLAUDE.md - Consumer Repository Context
 
-> **READ THIS FIRST** - This repository validates the stranske/Workflows workflow library.
+> **READ THIS FIRST** before making workflow changes.
 
-## Purpose
+## This is a Consumer Repo
 
-This repository exists to:
-1. **Validate reusable workflows** from stranske/Workflows work correctly
-2. **Test template synchronization** to consumer repos
-3. **Provide live examples** of workflow integration patterns
+This repository uses the **stranske/Workflows** workflow library. Most workflow logic lives there, not here.
 
-It serves as the "integration test suite" for the workflow library itself.
+**DO NOT** modify agent workflow files directly - they are synced from Workflows and will be overwritten.
 
 ## Architecture
 
 ```
-stranske/Workflows (workflow library)
+stranske/Workflows (central library)
     │
-    │ templates/integration-repo/ contains:
-    │   - .github/workflows/ci.yml
-    │   - pyproject.toml, src/, tests/
-    │   - helper scripts (sync_*, resolve_*)
+    │ reusable workflows called via:
+     │ uses: stranske/Workflows/.github/workflows/reusable-*.yml@v1
     │
-    │ Auto-sync via maint-69-sync-integration-repo.yml
     ▼
-This Repo (Workflows-Integration-Tests)
-    ├── .github/workflows/ci.yml    → SYNCED from templates/integration-repo/
-    ├── pyproject.toml              → SYNCED from templates/integration-repo/
-    ├── src/example/                → SYNCED minimal implementation
-    ├── tests/                      → LOCAL comprehensive test suite
-    ├── scripts/                    → SYNCED stub implementations
-    └── tools/                      → SYNCED stub implementations
+This Repo (consumer)
+    .github/workflows/
+      ├── agents-*.yml      → SYNCED from Workflows (don't edit)
+      ├── autofix.yml       → SYNCED from Workflows (don't edit)
+      ├── pr-00-gate.yml    → SYNCED but customizable
+      ├── ci.yml            → REPO-SPECIFIC (can edit)
+      └── autofix-versions.env → REPO-SPECIFIC (can edit)
 ```
 
-## Files Overview
+## Which Files Can Be Edited
 
-| File/Directory | Source | Purpose |
-|----------------|--------|---------|
-| `.github/workflows/ci.yml` | Synced from Workflows | Validates reusable CI workflow |
-| `src/example/` | Synced from Workflows | Minimal implementation for testing |
-| `tests/test_example.py` | Synced from Workflows | Basic smoke test |
-| `tests/test_*.py` | Local (this chat) | Comprehensive coverage tests |
-| `scripts/sync_*.py` | Synced from Workflows | Stub scripts called by reusable workflow |
-| `tools/resolve_mypy_pin.py` | Synced from Workflows | Stub tool for mypy version resolution |
-| `pyproject.toml` | Synced from Workflows | Minimal project config |
-| `CLAUDE.md` | Local (this chat) | Development context (this file) |
-| `.github/copilot-*` | Local (this chat) | Consumer repo development helpers |
-| `.github/codex/` | Local (this chat) | Agent automation prompts |
-| `config/coverage-baseline.json` | Local (this chat) | Coverage tracking |
+| File | Editable? | Notes |
+|------|-----------|-------|
+| `ci.yml` | ✅ Yes | Repo-specific CI configuration |
+| `autofix-versions.env` | ✅ Yes | Repo-specific dependency versions |
+| `pr-00-gate.yml` | ⚠️ Careful | Synced, but can customize if needed |
+| `agents-*.yml` | ❌ No | Synced from Workflows |
+| `autofix.yml` | ❌ No | Synced from Workflows |
 
-## Development Workflow
+## Keepalive System
 
-### Testing Changes to Templates
+When an issue is labeled `agent:codex`:
+1. `agents-63-issue-intake.yml` creates a PR with bootstrap file
+2. `agents-keepalive-loop.yml` runs Codex in iterations
+3. Codex works through tasks in PR body until all complete
 
-When modifying `templates/integration-repo/` in Workflows:
-1. Make changes in Workflows repo
-2. Push to main branch
-3. Sync workflow auto-triggers: `maint-69-sync-integration-repo.yml`
-4. Changes appear in this repo
-5. CI runs to validate changes work
+**Key prompts** (in `.github/codex/prompts/`):
+- `keepalive_next_task.md` - Normal work instructions
+- `fix_ci_failures.md` - CI fix instructions
 
-### Local Development
+## Common Issues
 
-This repo should have comprehensive tests for all scripts/tools even though they're stubs:
+### Workflow fails with "workflow file issue"
+- A reusable workflow is being called that doesn't exist
+- Check Workflows repo has the required `reusable-*.yml` file
+- Consumer workflows call INTO Workflows repo, not local files
+
+### Agent not picking up changes
+- Check PR has `agent:codex` label
+- Check Gate workflow passed (green checkmark)
+- Check PR body has unchecked tasks
+
+### Need to update agent workflows
+- DON'T edit locally - changes will be overwritten
+- Fix in Workflows repo → sync will propagate here
+- Or request manual sync: `gh workflow run maint-68-sync-consumer-repos.yml --repo stranske/Workflows`
+
+## Reference Implementation
+
+**Travel-Plan-Permission** is the reference consumer repo. When debugging:
+1. Check if it works there first
+2. Compare this repo's `.github/` with Travel-Plan-Permission
+3. Look for missing files or differences
+
+## Workflows Documentation
+
+For detailed docs, see **stranske/Workflows**:
+- `docs/INTEGRATION_GUIDE.md` - How consumer repos work
+- `docs/keepalive/GoalsAndPlumbing.md` - Keepalive system design
+- `docs/keepalive/SETUP_CHECKLIST.md` - Required files and secrets
+
+## Quick Debug Commands
 
 ```bash
-# Setup
-python -m venv .venv
-source .venv/bin/activate
-pip install -e ".[test,dev]"
+# Compare workflows with reference repo
+diff .github/workflows/autofix.yml \
+     <(gh api repos/stranske/Travel-Plan-Permission/contents/.github/workflows/autofix.yml --jq '.content' | base64 -d)
 
-# Run tests with coverage
-pytest --cov=src --cov=scripts --cov=tools --cov-report=term --cov-report=html
+# Check for missing files
+gh api repos/stranske/Travel-Plan-Permission/contents/.github/workflows --jq '.[].name' | sort > /tmp/tpp.txt
+ls .github/workflows/ | sort > /tmp/here.txt
+diff /tmp/tpp.txt /tmp/here.txt
 
-# Type checking
-mypy src/ scripts/ tools/
-
-# Code formatting
-black src/ scripts/ tools/ tests/
+# Trigger workflow sync from Workflows repo
+gh workflow run maint-68-sync-consumer-repos.yml --repo stranske/Workflows
 ```
-
-## Test Coverage Goals
-
-Even though scripts are stubs, they should have 100% coverage:
-- `scripts/sync_test_dependencies.py` - All CLI argument combinations
-- `scripts/sync_tool_versions.py` - All CLI argument combinations  
-- `tools/resolve_mypy_pin.py` - Environment variable handling, GITHUB_OUTPUT writing
-- `src/example/__init__.py` - Basic functionality
-
-## Relationship to Consumer Repos
-
-This repo demonstrates **minimal integration**. Real consumer repos like Travel-Plan-Permission or PAEM have:
-- Full agent automation workflows
-- Comprehensive keepalive systems
-- Production code and tests
-- Custom CI configurations
-
-This repo validates that the **basic integration pattern works** before consumer repos adopt changes.
-
-## Sync System
-
-### Automatic Sync
-
-Triggered by pushes to `templates/integration-repo/**` in Workflows:
-- **Health Check**: `health-67-integration-sync-check.yml` validates sync status
-- **Sync Workflow**: `maint-69-sync-integration-repo.yml` pushes template updates
-
-### Manual Sync
-
-```bash
-# From Workflows repo
-gh workflow run maint-69-sync-integration-repo.yml --repo stranske/Workflows
-
-# Or with dry-run
-gh workflow run maint-69-sync-integration-repo.yml --repo stranske/Workflows -f dry-run=true
-```
-
-## CI Workflow Details
-
-The `ci.yml` workflow calls the reusable Python CI workflow:
-
-```yaml
-jobs:
-  ci:
-    uses: stranske/Workflows/.github/workflows/reusable-10-ci-python.yml@v1
-    with:
-      python-version: '3.11'
-    secrets: inherit
-```
-
-This validates:
-- ✅ Workflow can be called from external repo
-- ✅ Python matrix execution works
-- ✅ Test execution succeeds
-- ✅ Coverage reporting works
-- ✅ Helper scripts integrate correctly
-
-## Debugging Sync Issues
-
-If templates aren't syncing:
-
-```bash
-# Check last sync workflow run
-gh run list --workflow=maint-69-sync-integration-repo.yml --repo stranske/Workflows --limit 5
-
-# Check health workflow for detected drift
-gh run list --workflow=health-67-integration-sync-check.yml --repo stranske/Workflows --limit 5
-
-# Compare local files with templates
-diff .github/workflows/ci.yml <(cat /workspaces/Workflows/templates/integration-repo/.github/workflows/ci.yml)
-```
-
-## Common Patterns
-
-### Adding New Test Coverage
-
-When adding tests (like in this chat session):
-1. Tests live in `tests/` and are NOT synced from Workflows
-2. Test files use pytest conventions: `test_*.py`
-3. Aim for 100% coverage of all scripts/tools
-4. Tests should validate behavior, not just achieve coverage
-
-### Updating Synced Files
-
-DO NOT edit files that are synced from Workflows:
-- `.github/workflows/ci.yml`
-- `src/example/__init__.py`
-- `tests/test_example.py`
-- `scripts/sync_*.py`
-- `tools/resolve_mypy_pin.py`
-- `pyproject.toml` (except for dev dependencies)
-
-These will be overwritten on next sync.
-
-## Development Tools
-
-This repo now includes consumer repo development elements:
-- `.github/copilot-instructions.md` - GitHub Copilot context
-- `.github/copilot-skills/` - Skill-specific Copilot guidance
-- `.github/codex/` - Agent automation prompts
-- `config/coverage-baseline.json` - Coverage tracking baseline
-
-These help make development easier and provide examples for other consumer repos.
 
 ---
 
-**Next Steps**: Run comprehensive test suite to validate coverage, then commit all changes to a feature branch.
+## �� POLICY: Cross-Repo Work
+
+> **CRITICAL**: Read this before ANY work that might affect the Workflows repo.
+
+### Policy Checkpoint Trigger
+
+When creating a todo list, ask:
+
+**"Does this work need changes in stranske/Workflows?"**
+
+Signs that you need Workflows changes:
+- Adding a new agent capability
+- Modifying how keepalive/autofix/verifier works
+- Needing a new Codex prompt
+- Bug in a reusable workflow
+
+### If YES → Work in Workflows First
+
+1. Clone/checkout stranske/Workflows
+2. Make changes there (following Workflows CLAUDE.md policy)
+3. Ensure sync manifest is updated
+4. Trigger sync to propagate to this repo
+5. Then verify in this repo
+
+**DO NOT** try to fix Workflows issues by editing local files - they will be overwritten on next sync.
+
+### Add Policy Verification Todo
+
+When your todo list involves cross-repo coordination, add as **FINAL** item:
+
+```
+✅ Verify cross-repo policy compliance:
+   - [ ] Changes made in correct repo (Workflows vs Consumer)
+   - [ ] Sync triggered if needed
+   - [ ] Both repos have passing CI
+```
+
+### Quick Commands
+
+```bash
+# Check if a file is synced (compare to template)
+diff .github/workflows/agents-keepalive-loop.yml \
+     <(gh api repos/stranske/Workflows/contents/templates/consumer-repo/.github/workflows/agents-keepalive-loop.yml --jq '.content' | base64 -d)
+
+# Trigger sync from Workflows
+gh workflow run maint-68-sync-consumer-repos.yml --repo stranske/Workflows -f repos="${{ github.repository }}"
+
+# Check sync manifest for what SHOULD be here
+gh api repos/stranske/Workflows/contents/.github/sync-manifest.yml --jq '.content' | base64 -d
+```
