@@ -44,9 +44,7 @@ def test_main_with_github_output_and_pyproject(
     assert "python-version=3.12" in content
 
 
-def test_main_falls_back_to_matrix_version(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_main_falls_back_to_matrix_version(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Test script uses MATRIX_PYTHON_VERSION when no pyproject.toml."""
     # No pyproject.toml in tmp_path
     output_file = tmp_path / "github_output.txt"
@@ -91,9 +89,7 @@ def test_main_defaults_to_311(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
     assert "python-version=3.11" in captured_output.getvalue()
 
 
-def test_main_without_github_output(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_main_without_github_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Test script works locally without GITHUB_OUTPUT."""
     monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
     monkeypatch.setenv("MATRIX_PYTHON_VERSION", "3.11")
