@@ -7,7 +7,7 @@ versions).
 
 The script:
 1. Reads the target Python version from pyproject.toml's [tool.mypy] section
-2. Falls back to the first version in the CI matrix
+2. Falls back to the CI matrix version when no pyproject.toml is present
 3. Outputs the resolved version to GITHUB_OUTPUT for workflow use
 """
 
@@ -69,11 +69,11 @@ def main() -> int:
     mypy_version = get_mypy_python_version()
 
     # Determine which version to output
-    # Prefer the matrix version when provided; fall back to mypy config or default.
-    if matrix_version:  # noqa: SIM108
-        output_version = matrix_version
-    elif mypy_version:
+    # Prefer the mypy config when present; fall back to matrix or default.
+    if mypy_version:  # noqa: SIM108
         output_version = mypy_version
+    elif matrix_version:
+        output_version = matrix_version
     else:
         # Default to the primary Python version (first in typical matrices)
         output_version = "3.11"
