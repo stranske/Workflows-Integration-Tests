@@ -192,8 +192,7 @@ jobs:
                   });
                   console.log('Created commit status with GITHUB_TOKEN');
                 } catch (fallbackError) {
-                  core.error(`Fallback also failed: ${fallbackError.message}`);
-                  throw fallbackError;
+                  core.warning(`Fallback also failed: ${fallbackError.message}`);
                 }
               } else if (isRateLimitError) {
                 core.warning('Rate limit prevented Gate from updating the commit status.');
