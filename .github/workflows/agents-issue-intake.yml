@@ -196,19 +196,3 @@ jobs:
       WORKFLOWS_APP_ID: ${{ secrets.WORKFLOWS_APP_ID }}
       WORKFLOWS_APP_PRIVATE_KEY: ${{ secrets.WORKFLOWS_APP_PRIVATE_KEY }}
 
-  # ChatGPT sync mode: Call the Workflows repo reusable workflow with sync capability
-  sync:
-    needs: route
-    if: needs.route.outputs.should_run_sync == 'true'
-    permissions:
-      contents: write
-      issues: write
-      id-token: write
-      models: read
-      pull-requests: write
-    uses: stranske/Workflows/.github/workflows/agents-63-issue-intake.yml@main
-    with:
-      intake_mode: "chatgpt_sync"
-      source: ${{ inputs.topic_files }}
-      apply_langchain_formatting: ${{ inputs.apply_langchain_formatting && 'true' || 'false' }}
-    secrets: inherit
