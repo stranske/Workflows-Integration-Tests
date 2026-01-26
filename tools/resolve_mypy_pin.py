@@ -69,12 +69,14 @@ def main() -> int:
     mypy_version = get_mypy_python_version()
 
     # Determine which version to output
-    # If mypy has a configured version, use it; otherwise use matrix version
-    if mypy_version:  # noqa: SIM108
+    # Prefer the matrix version when provided; fall back to mypy config or default.
+    if matrix_version:  # noqa: SIM108
+        output_version = matrix_version
+    elif mypy_version:
         output_version = mypy_version
     else:
         # Default to the primary Python version (first in typical matrices)
-        output_version = matrix_version or "3.11"
+        output_version = "3.11"
 
     # Write to GITHUB_OUTPUT
     github_output = os.environ.get("GITHUB_OUTPUT")
