@@ -126,10 +126,10 @@ jobs:
           TARGET_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           # Pass both tokens so script can fallback if App lacks permission
           APP_TOKEN: ${{ steps.app_token.outputs.token || '' }}
-          GITHUB_TOKEN_FALLBACK: ${{ github.token }}
+          GITHUB_TOKEN_FALLBACK: ${{ secrets.ACTIONS_BOT_PAT || github.token }}
         with:
           # Use app token if available (5000/hr pool) to avoid rate limits
-          github-token: ${{ steps.app_token.outputs.token || github.token }}
+          github-token: ${{ steps.app_token.outputs.token || secrets.ACTIONS_BOT_PAT || github.token }}
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
