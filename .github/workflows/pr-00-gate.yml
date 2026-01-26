@@ -170,13 +170,27 @@ jobs:
                 /rate limit/i.test(error?.message || '');
 
               if (isPermissionError && process.env.APP_TOKEN) {
-                // App token lacks statuses:write permission, try GITHUB_TOKEN
+                // App token lacks statuses:write permission, try GITHUB_TOKEN directly
                 core.warning('App token lacks statuses permission, falling back to GITHUB_TOKEN');
-                const { getOctokit } = require('@actions/github');
-                const fallbackOctokit = getOctokit(process.env.GITHUB_TOKEN_FALLBACK);
-                
+                const fallbackToken = process.env.GITHUB_TOKEN_FALLBACK;
+                if (!fallbackToken) {
+                  throw error;
+                }
+
                 try {
-                  await createStatus(fallbackOctokit, 'GITHUB_TOKEN');
+                  await github.request('POST /repos/{owner}/{repo}/statuses/{sha}', {
+                    owner,
+                    repo,
+                    sha,
+                    state,
+                    context: 'Gate / gate',
+                    description,
+                    target_url: targetUrl,
+                    headers: {
+                      authorization: `token ${fallbackToken}`,
+                    },
+                  });
+                  console.log('Created commit status with GITHUB_TOKEN');
                 } catch (fallbackError) {
                   core.error(`Fallback also failed: ${fallbackError.message}`);
                   throw fallbackError;
