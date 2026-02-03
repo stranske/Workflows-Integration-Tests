@@ -44,7 +44,7 @@ pytest-cov==7.0.0
     # via workflows-integration (pyproject.toml)
 pytokens==0.4.1
     # via black
-ruff==0.14.14
+ruff==0.15.0
     # via workflows-integration (pyproject.toml)
 tomli==2.4.0 ; python_full_version <= '3.11'
     # via coverage
