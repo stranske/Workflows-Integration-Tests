@@ -8,7 +8,7 @@ colorama==0.4.6 ; sys_platform == 'win32'
     # via
     #   click
     #   pytest
-coverage==7.13.2
+coverage==7.13.3
     # via pytest-cov
 iniconfig==2.3.0
     # via pytest
@@ -24,7 +24,7 @@ packaging==26.0
     # via
     #   black
     #   pytest
-pathspec==1.0.3
+pathspec==1.0.4
     # via
     #   black
     #   mypy
@@ -42,7 +42,7 @@ pytest==9.0.2
     #   pytest-cov
 pytest-cov==7.0.0
     # via workflows-integration (pyproject.toml)
-pytokens==0.4.0
+pytokens==0.4.1
     # via black
 ruff==0.14.14
     # via workflows-integration (pyproject.toml)
