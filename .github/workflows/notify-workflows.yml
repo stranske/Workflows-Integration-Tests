@@ -27,42 +27,76 @@ jobs:
     # Only notify on push to main (not PRs) to avoid noise
     if: github.event_name == 'push'
     steps:
+      - name: Checkout retry helpers (Workflows)
+        if: ${{ secrets.ACTIONS_BOT_PAT != '' }}
+        uses: actions/checkout@v4
+        with:
+          repository: stranske/Workflows
+          path: workflows
+          fetch-depth: 1
+          sparse-checkout: |
+            .github/actions/setup-api-client
+            .github/scripts/github-api-with-retry.js
+            .github/scripts/token_load_balancer.js
+          sparse-checkout-cone-mode: false
+
+      - name: Setup API client
+        if: ${{ secrets.ACTIONS_BOT_PAT != '' }}
+        uses: ./workflows/.github/actions/setup-api-client
+        with:
+          secrets: ${{ toJSON(secrets) }}
+          github_token: ${{ github.token }}
+
       - name: Trigger sync check in Workflows
-        env:
-          GH_TOKEN: ${{ secrets.ACTIONS_BOT_PAT }}
+        if: ${{ secrets.ACTIONS_BOT_PAT != '' }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.ACTIONS_BOT_PAT }}
+          script: |
+            const { createTokenAwareRetry } = require(
+              './workflows/.github/scripts/github-api-with-retry.js'
+            );
+            const { withRetry } = await createTokenAwareRetry({
+              github,
+              core,
+              env: process.env,
+              task: 'integration-notify',
+            });
+
+            await withRetry(() => github.rest.repos.createDispatchEvent({
+              owner: 'stranske',
+              repo: 'Workflows',
+              event_type: 'integration-config-changed',
+              client_payload: {
+                source: 'Workflows-Integration-Tests',
+                commit: context.sha,
+                ref: context.ref,
+              },
+            }));
+
+      - name: Skip notification (missing token)
+        if: ${{ secrets.ACTIONS_BOT_PAT == '' }}
         run: |
-          if [ -z "$GH_TOKEN" ]; then
-            echo "::warning::ACTIONS_BOT_PAT not available, skipping notification"
-            exit 0
-          fi
-
-          gh api \
-            --method POST \
-            -H "Accept: application/vnd.github+json" \
-            repos/stranske/Workflows/dispatches \
-            -f event_type='integration-config-changed' \
-            -f 'client_payload[source]=Workflows-Integration-Tests' \
-            -f "client_payload[commit]=${{ github.sha }}" \
-            -f "client_payload[ref]=${{ github.ref }}"
-
-          echo "✅ Notified Workflows repo of config change"
+          echo "::warning::ACTIONS_BOT_PAT not available, skipping notification"
 
   validate-against-template:
     name: Validate against template
     runs-on: ubuntu-latest
     steps:
       - name: Checkout this repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
           path: integration-tests
 
       - name: Clone Workflows repo templates
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh repo clone stranske/Workflows workflows -- --depth=1 --sparse
-          cd workflows
-          git sparse-checkout set templates/integration-repo
+        uses: actions/checkout@v4
+        with:
+          repository: stranske/Workflows
+          path: workflows
+          fetch-depth: 1
+          sparse-checkout: |
+            templates/integration-repo
+          sparse-checkout-cone-mode: false
 
       - name: Validate CI workflow inputs
         run: |
@@ -108,12 +142,13 @@ jobs:
           echo "## Artifact Prefix Validation" >> "$GITHUB_STEP_SUMMARY"
 
           # Count jobs using reusable workflow
-          job_count=$(grep -c "uses:.*reusable-10-ci-python" "$ACTUAL" || echo "0")
-          prefix_count=$(grep -c "artifact-prefix:" "$ACTUAL" || echo "0")
+          job_count=$(grep -c "uses:.*reusable-10-ci-python" "$ACTUAL" || printf '0')
+          prefix_count=$(grep -c "artifact-prefix:" "$ACTUAL" || printf '0')
 
           if [ "$job_count" -gt 1 ] && [ "$prefix_count" -lt "$job_count" ]; then
-            echo "::error::Multi-job CI requires artifact-prefix on each job to avoid conflicts"
-            echo "❌ Missing artifact-prefix on some jobs ($prefix_count/$job_count)" >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Multi-job CI requires artifact-prefix on each job"
+            echo "❌ Missing artifact-prefix on some jobs" >> "$GITHUB_STEP_SUMMARY"
+            echo "($prefix_count/$job_count)" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
 
