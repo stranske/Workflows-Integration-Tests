@@ -29,7 +29,7 @@ jobs:
     steps:
       - name: Checkout retry helpers (Workflows)
         if: ${{ secrets.ACTIONS_BOT_PAT != '' }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: stranske/Workflows
           path: workflows
@@ -49,7 +49,7 @@ jobs:
 
       - name: Trigger sync check in Workflows
         if: ${{ secrets.ACTIONS_BOT_PAT != '' }}
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           github-token: ${{ secrets.ACTIONS_BOT_PAT }}
           script: |
@@ -84,12 +84,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout this repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: integration-tests
 
       - name: Clone Workflows repo templates
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: stranske/Workflows
           path: workflows
