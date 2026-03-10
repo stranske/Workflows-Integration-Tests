@@ -70,7 +70,7 @@ jobs:
             core.setOutput('pr_number', pr.number);
             core.setOutput('comment_id', comment.id);
             // Encode comment body as Base64 to safely handle multiline and special characters.
-            // The reusable workflow at stranske/Workflows/.github/workflows/reusable-20-pr-meta.yml
+            // The reusable workflow at iamkayleb/Workflows/.github/workflows/reusable-20-pr-meta.yml
             // expects this value to be Base64-encoded and is responsible for decoding it.
             core.setOutput('comment_body', Buffer.from(comment.body || '').toString('base64'));
 

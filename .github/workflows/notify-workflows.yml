@@ -31,7 +31,7 @@ jobs:
         if: ${{ secrets.ACTIONS_BOT_PAT != '' }}
         uses: actions/checkout@v6
         with:
-          repository: stranske/Workflows
+          repository: iamkayleb/Workflows
           path: workflows
           fetch-depth: 1
           sparse-checkout: |
@@ -91,7 +91,7 @@ jobs:
       - name: Clone Workflows repo templates
         uses: actions/checkout@v6
         with:
-          repository: stranske/Workflows
+          repository: iamkayleb/Workflows
           path: workflows
           fetch-depth: 1
           sparse-checkout: |

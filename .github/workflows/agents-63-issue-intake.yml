@@ -394,7 +394,7 @@ jobs:
         if: needs.normalize_inputs.outputs.apply_langchain_formatting == 'true'
         uses: actions/checkout@v6
         with:
-          repository: stranske/Workflows
+          repository: iamkayleb/Workflows
           sparse-checkout: |
             scripts/langchain/topic_splitter.py
           sparse-checkout-cone-mode: false
