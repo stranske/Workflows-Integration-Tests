@@ -18,7 +18,7 @@ jobs:
   # Configuration 1: Basic - minimal settings, single Python version
   basic:
     name: Basic (3.12 only)
-    uses: stranske/Workflows/.github/workflows/reusable-10-ci-python.yml@main
+    uses: iamkayleb/Workflows/.github/workflows/reusable-10-ci-python.yml@main
     with:
       python-versions: '["3.12"]'
       coverage: false
@@ -35,7 +35,7 @@ jobs:
   # Configuration 2: Full coverage - all features enabled
   full-coverage:
     name: Full coverage (3.11, 3.12)
-    uses: stranske/Workflows/.github/workflows/reusable-10-ci-python.yml@main
+    uses: iamkayleb/Workflows/.github/workflows/reusable-10-ci-python.yml@main
     with:
       python-versions: '["3.11", "3.12"]'
       coverage: true
@@ -55,7 +55,7 @@ jobs:
   # Configuration 3: Typecheck only - focused mypy validation
   typecheck-only:
     name: Typecheck only (3.11)
-    uses: stranske/Workflows/.github/workflows/reusable-10-ci-python.yml@main
+    uses: iamkayleb/Workflows/.github/workflows/reusable-10-ci-python.yml@main
     with:
       python-versions: '["3.11"]'
       coverage: false
@@ -73,7 +73,7 @@ jobs:
   # Configuration 4: Lint only - no tests, just code quality
   lint-only:
     name: Lint only (3.12)
-    uses: stranske/Workflows/.github/workflows/reusable-10-ci-python.yml@main
+    uses: iamkayleb/Workflows/.github/workflows/reusable-10-ci-python.yml@main
     with:
       python-versions: '["3.12"]'
       coverage: false
