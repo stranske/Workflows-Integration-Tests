@@ -1,7 +1,5 @@
 """Tests for capability_check.py — particularly that string input is handled correctly."""
 
-import pytest
-
 from scripts.langchain.capability_check import check_capability, classify_capabilities
 
 
@@ -29,9 +27,9 @@ def test_classify_capabilities_string_does_not_iterate_characters() -> None:
     result = classify_capabilities(sentence, "")
     # _parse_tasks_from_text only picks up bullet lines; a plain sentence yields
     # no tasks rather than ~60 individual characters.
-    assert all(len(t) > 1 for t in result.actionable_tasks), (
-        "Tasks should not be individual characters"
-    )
+    assert all(
+        len(t) > 1 for t in result.actionable_tasks
+    ), "Tasks should not be individual characters"
 
 
 def test_check_capability_alias_accepts_string() -> None:
