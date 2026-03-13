@@ -279,7 +279,9 @@ def _fallback_classify(
     )
 
 
-def classify_capabilities(tasks: list[str], acceptance: str) -> CapabilityCheckResult:
+def classify_capabilities(tasks: list[str] | str, acceptance: str) -> CapabilityCheckResult:
+    if isinstance(tasks, str):
+        tasks = _parse_tasks_from_text(tasks)
     client_info = _get_llm_client()
     if not client_info:
         return _fallback_classify(tasks, acceptance, "LLM provider unavailable")
