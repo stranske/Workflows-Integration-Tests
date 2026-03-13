@@ -1,0 +1,26 @@
+1) Issue title here
+Labels: agent:codex, enhancement, area:backend
+
+Why
+Describe why this work is needed.
+
+Scope
+- What is included
+- What is not included (Non-Goals)
+
+Tasks
+- [ ] First task to complete
+- [ ] Second task to complete
+- [ ] Third task to complete
+
+Acceptance criteria
+- First acceptance criterion
+- Second acceptance criterion
+
+Implementation notes
+Any technical notes or guidance.
+
+2) Second issue title
+Labels: agent:codex, bug
+
+Why

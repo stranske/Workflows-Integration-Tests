@@ -20,3 +20,14 @@ codex-output.md
 codex-prompt-*.md
 codex-output-*.md
 verifier-context.md
+
+# Codex working files (preserved via workflow artifacts, not git)
+# CRITICAL: These must be gitignored to prevent merge conflicts when
+# multiple PRs run keepalive simultaneously. Each run rebuilds these files.
+# Generic names (legacy)
+codex-prompt.md
+codex-output.md
+# PR-specific names (used by reusable-codex-run.yml to avoid conflicts)
+codex-prompt-*.md
+codex-output-*.md
+verifier-context.md

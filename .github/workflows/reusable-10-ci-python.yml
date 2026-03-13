@@ -1,0 +1,2466 @@
+name: Reusable CI
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Relative working directory ('.' for repo root).
+        required: false
+        default: '.'
+        type: string
+      python-version:
+        description: Primary Python version to use when `python-versions` is not provided.
+        required: false
+        default: '3.11'
+        type: string
+      python-versions:
+        description: JSON array of Python versions to execute. Takes precedence when non-empty.
+        required: false
+        default: '[]'
+        type: string
+      primary-python-version:
+        description: Preferred Python runtime that should publish soft-gate artifacts when enabled.
+        required: false
+        default: '3.11'
+        type: string
+      marker:
+        description: Deprecated alias for `pytest_markers`. Use `pytest_markers` instead.
+        required: false
+        default: ''
+        type: string
+      pytest_markers:
+        description: Optional pytest marker expression overriding `marker` when provided.
+        required: false
+        default: ''
+        type: string
+      pytest_args:
+        description: Additional pytest args/paths appended to the test command (workflow_call only).
+        required: false
+        default: ''
+        type: string
+      coverage-min:
+        description: Minimum coverage percentage required to pass.
+        required: false
+        default: '70'
+        type: string
+      lint:
+        description: Toggle Ruff lint execution.
+        required: false
+        default: true
+        type: boolean
+      format_check:
+        description: Toggle Black format check execution.
+        required: false
+        default: true
+        type: boolean
+      typecheck:
+        description: Toggle mypy execution.
+        required: false
+        default: true
+        type: boolean
+      run-mypy:
+        description: Deprecated alias for `typecheck`. Will be removed in `v2.0.0`.
+        required: false
+        default: true
+        type: boolean
+      coverage:
+        description: Toggle coverage instrumentation, packaging, and enforcement.
+        required: false
+        default: true
+        type: boolean
+      cache:
+        description: Toggle pip and pytest cache integration.
+        required: false
+        default: true
+        type: boolean
+      enable-metrics:
+        description: Enable metrics artifact generation.
+        required: false
+        default: false
+        type: boolean
+      slow-test-top:
+        description: Maximum number of slow tests to record when metrics are enabled.
+        required: false
+        default: '15'
+        type: string
+      slow-test-min-seconds:
+        description: Minimum duration (in seconds) for slow test tracking.
+        required: false
+        default: '1'
+        type: string
+      enable-history:
+        description: Append metrics history NDJSON artifact.
+        required: false
+        default: false
+        type: boolean
+      enable-classification:
+        description: Emit failure classification payload alongside metrics history.
+        required: false
+        default: false
+        type: boolean
+      history-artifact-name:
+        description: Artifact filename for metrics history output.
+        required: false
+        default: 'metrics-history.ndjson'
+        type: string
+      enable-coverage-delta:
+        description: Compute coverage delta vs baseline configuration.
+        required: false
+        default: false
+        type: boolean
+      baseline-coverage:
+        description: Coverage baseline percentage for delta calculations.
+        required: false
+        default: '0'
+        type: string
+      coverage-alert-drop:
+        description: Coverage drop threshold (percentage points) that triggers an alert.
+        required: false
+        default: '1'
+        type: string
+      fail-on-coverage-drop:
+        description: Fail the job when the coverage drop meets or exceeds the threshold.
+        required: false
+        default: false
+        type: boolean
+      coverage-drop-label:
+        description: Reserved label hook for downstream automation reacting to coverage drops.
+        required: false
+        default: 'coverage-drop'
+        type: string
+      enable-soft-gate:
+        description: Publish coverage trend and summary artifacts.
+        required: false
+        default: false
+        type: boolean
+      artifact-prefix:
+        description: Optional prefix applied to all uploaded artifact names.
+        required: false
+        default: 'gate-'
+        type: string
+    secrets:
+      pypi-token:
+        description: Optional token for private dependencies.
+        required: false
+      workflows_app_id:
+        required: false
+      workflows_app_private_key:
+        required: false
+  workflow_dispatch:
+    inputs:
+      working-directory:
+        description: Working directory for all run steps (useful for monorepos).
+        required: false
+        default: '.'
+      python-versions:
+        description: JSON array of Python versions to execute.
+        required: false
+        default: '["3.11"]'
+      pytest_markers:
+        description: Optional pytest marker expression.
+        required: false
+        default: ''
+      lint:
+        description: Toggle Ruff lint execution.
+        required: false
+        default: true
+        type: boolean
+      format_check:
+        description: Toggle Black format check execution.
+        required: false
+        default: true
+        type: boolean
+      typecheck:
+        description: Toggle mypy execution.
+        required: false
+        default: true
+        type: boolean
+      coverage:
+        description: Toggle coverage instrumentation, packaging, and enforcement.
+        required: false
+        default: true
+        type: boolean
+      cache:
+        description: Toggle pip and pytest cache integration.
+        required: false
+        default: true
+        type: boolean
+      enable-metrics:
+        description: Enable metrics artifact generation.
+        required: false
+        default: false
+        type: boolean
+      enable-history:
+        description: Append metrics history NDJSON artifact.
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  validate-inputs:
+    name: Validate inputs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 1
+    steps:
+      - name: Validate workflow inputs
+        env:
+          PYTHON_VERSIONS: ${{ inputs['python-versions'] || '' }}
+          COVERAGE_MIN: ${{ inputs['coverage-min'] || '' }}
+          SLOW_TEST_TOP: ${{ inputs['slow-test-top'] || '' }}
+          SLOW_TEST_MIN_SECONDS: ${{ inputs['slow-test-min-seconds'] || '' }}
+          BASELINE_COVERAGE: ${{ inputs['baseline-coverage'] || '' }}
+          COVERAGE_ALERT_DROP: ${{ inputs['coverage-alert-drop'] || '' }}
+          LINT: ${{ inputs['lint'] }}
+          FORMAT_CHECK: ${{ inputs['format_check'] }}
+          TYPECHECK: ${{ inputs['typecheck'] }}
+          RUN_MYPY: ${{ inputs['run-mypy'] }}
+          COVERAGE: ${{ inputs['coverage'] }}
+          CACHE: ${{ inputs['cache'] }}
+          ENABLE_METRICS: ${{ inputs['enable-metrics'] }}
+          ENABLE_HISTORY: ${{ inputs['enable-history'] }}
+          ENABLE_CLASSIFICATION: ${{ inputs['enable-classification'] }}
+          ENABLE_COVERAGE_DELTA: ${{ inputs['enable-coverage-delta'] }}
+          FAIL_ON_COVERAGE_DROP: ${{ inputs['fail-on-coverage-drop'] }}
+          ENABLE_SOFT_GATE: ${{ inputs['enable-soft-gate'] }}
+        shell: bash
+        run: |
+          python <<'PY'
+          import json
+          import os
+          import sys
+          from typing import NoReturn
+
+          def fail(message: str) -> NoReturn:
+            print(f"::error ::{message}")
+            sys.exit(1)
+
+          def validate_boolean(name: str) -> None:
+            raw = os.getenv(name, "")
+            if raw == "":
+              return
+            value = raw.lower()
+            if value not in {"true", "false"}:
+              fail(
+                f"{name.replace('_', '-')} must be a boolean string of 'true' or 'false' "
+                f"(received {raw!r})."
+              )
+
+          def validate_number(
+            name: str,
+            raw: str,
+            *,
+            min_value: float | None = None,
+            max_value: float | None = None,
+            integer: bool = False,
+          ) -> None:
+            if raw == "":
+              return
+            try:
+              value = int(raw) if integer else float(raw)
+            except ValueError:
+              constraint = (
+                f" between {min_value}-{max_value}"
+                if min_value is not None and max_value is not None
+                else ""
+              )
+              fail(f"{name} must be a number{constraint} (received {raw!r}).")
+            if min_value is not None and value < min_value:
+              fail(f"{name} must be a number between {min_value}-{max_value} (received {raw!r}).")
+            if max_value is not None and value > max_value:
+              fail(f"{name} must be a number between {min_value}-{max_value} (received {raw!r}).")
+
+          python_versions_raw = os.getenv("PYTHON_VERSIONS", "")
+          if python_versions_raw and python_versions_raw != "[]":
+            try:
+              python_versions = json.loads(python_versions_raw)
+            except json.JSONDecodeError:
+              fail(
+                'python-versions must be a valid JSON array of strings '
+                '(example: ["3.11", "3.12"]).'
+              )
+            if not isinstance(python_versions, list):
+              fail('python-versions must be a JSON array (example: ["3.11", "3.12"]).')
+            if not python_versions:
+              fail('python-versions must include at least one version (example: ["3.11", "3.12"]).')
+            for version in python_versions:
+              if not isinstance(version, str) or not version.strip():
+                fail(
+                  'python-versions entries must be non-empty strings '
+                  '(example: ["3.11", "3.12"]).'
+                )
+
+          validate_number(
+            "coverage-min",
+            os.getenv("COVERAGE_MIN", ""),
+            min_value=0,
+            max_value=100,
+          )
+          validate_number(
+            "slow-test-top",
+            os.getenv("SLOW_TEST_TOP", ""),
+            min_value=0,
+            max_value=None,
+            integer=True,
+          )
+          validate_number(
+            "slow-test-min-seconds",
+            os.getenv("SLOW_TEST_MIN_SECONDS", ""),
+            min_value=0,
+            max_value=None,
+            integer=True,
+          )
+          validate_number(
+            "baseline-coverage",
+            os.getenv("BASELINE_COVERAGE", ""),
+            min_value=0,
+            max_value=100,
+          )
+          validate_number(
+            "coverage-alert-drop",
+            os.getenv("COVERAGE_ALERT_DROP", ""),
+            min_value=0,
+            max_value=100,
+          )
+
+          for boolean_env in (
+            "LINT",
+            "FORMAT_CHECK",
+            "TYPECHECK",
+            "RUN_MYPY",
+            "COVERAGE",
+            "CACHE",
+            "ENABLE_METRICS",
+            "ENABLE_HISTORY",
+            "ENABLE_CLASSIFICATION",
+            "ENABLE_COVERAGE_DELTA",
+            "FAIL_ON_COVERAGE_DROP",
+            "ENABLE_SOFT_GATE",
+          ):
+            validate_boolean(boolean_env)
+          PY
+
+      - name: Emit deprecated input warnings
+        if: ${{ inputs.marker != '' || inputs['run-mypy'] != true }}
+        env:
+          MARKER: ${{ inputs.marker }}
+          RUN_MYPY: ${{ inputs['run-mypy'] }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${MARKER}" ]; then
+            echo "::warning ::Input 'marker' is deprecated and will be removed in v2.0.0. " \
+              "Use 'pytest_markers' instead."
+          fi
+          if [ "${RUN_MYPY}" != "true" ]; then
+            echo "::warning ::Input 'run-mypy' is deprecated and will be removed in v2.0.0. " \
+              "Use 'typecheck' to control mypy execution."
+          fi
+
+  lint-format:
+    name: lint-format
+    needs: validate-inputs
+    if: ${{ inputs.format_check }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs['working-directory'] || '.' }}
+    env:
+      WORKDIR: ${{ inputs['working-directory'] || '.' }}
+      WORKSPACE_ROOT: ${{ github.workspace }}
+      PROJECT_ROOT: >-
+        ${{ inputs['working-directory'] != '' && inputs['working-directory'] != '.' &&
+        format('{0}/{1}', github.workspace, inputs['working-directory'])
+        || github.workspace }}
+    outputs:
+      format_outcome: ${{ steps.finalize.outputs.outcome || steps.black.outcome || 'skipped' }}
+    steps:
+      - name: Checkout Workflows repo for actions
+        uses: actions/checkout@v6
+        with:
+          repository: stranske/Workflows
+          path: .workflows-lib
+          sparse-checkout: |
+            .github/actions/setup-api-client
+          sparse-checkout-cone-mode: false
+
+      - name: Setup API client
+        uses: ./.workflows-lib/.github/actions/setup-api-client
+        with:
+          secrets: ${{ toJSON(secrets) }}
+          github_token: ${{ github.token }}
+
+      - name: Checkout repository
+        if: ${{ inputs['working-directory'] == '' || inputs['working-directory'] == '.' }}
+        uses: actions/checkout@v6
+        with:
+          submodules: false
+          fetch-depth: 1
+
+      - name: Checkout repository (sparse)
+        if: ${{ inputs['working-directory'] != '' && inputs['working-directory'] != '.' }}
+        uses: actions/checkout@v6
+        with:
+          submodules: false
+          fetch-depth: 1
+          sparse-checkout: |
+            .github/workflows
+            scripts
+            tools
+            config
+            ${{ inputs['working-directory'] }}
+          sparse-checkout-cone-mode: true
+
+
+      # Inlined from .github/actions/python-ci-setup for external repo compatibility
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: >-
+            ${{
+              inputs['primary-python-version']
+              || inputs['python-version']
+              || '3.11'
+            }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Install uv
+        shell: bash
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Cache uv artifacts
+        if: ${{ inputs.cache }}
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cache/uv
+          key: >-
+            ${{ format(
+            'uv-{0}-{1}-{2}-{3}',
+            runner.os,
+            inputs['primary-python-version'] || inputs['python-version'] || '3.11',
+            hashFiles(format('{0}/requirements.lock', inputs['working-directory'] || '.')),
+            hashFiles(format('{0}/pyproject.toml', inputs['working-directory'] || '.'))
+            ) }}
+          restore-keys: |
+            uv-${{ runner.os }}-
+
+      - name: Install dependencies
+        shell: bash
+        working-directory: ${{ inputs['working-directory'] || '.' }}
+        env:
+          PRIVATE_PYPI_TOKEN: ${{ secrets.pypi-token }}
+          WORKDIR: ${{ inputs['working-directory'] || '.' }}
+          INPUT_LINT: ${{ inputs.lint }}
+          INPUT_FORMAT_CHECK: ${{ inputs.format_check }}
+          INPUT_INSTALL_PROJECT_DEPS: 'false'
+          INPUT_TYPECHECK: 'false'
+          INPUT_RUN_MYPY: 'false'
+          INPUT_COVERAGE: 'false'
+          INPUT_PYTHON_VERSION: >-
+            ${{
+              inputs['primary-python-version']
+              || inputs['python-version']
+              || '3.11'
+            }}
+        run: |
+          set -euo pipefail
+          start_ts=$(date +%s)
+
+          to_bool() {
+            case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+              1|true|yes|y|on) echo "true" ;;
+              *) echo "false" ;;
+            esac
+          }
+
+          lint_enabled=$(to_bool "$INPUT_LINT")
+          format_enabled=$(to_bool "$INPUT_FORMAT_CHECK")
+          typecheck_enabled=$(to_bool "$INPUT_TYPECHECK")
+          run_mypy_enabled=$(to_bool "$INPUT_RUN_MYPY")
+          coverage_enabled=$(to_bool "$INPUT_COVERAGE")
+          install_project_deps=$(to_bool "${INPUT_INSTALL_PROJECT_DEPS:-true}")
+          mypy_enabled="false"
+          if [ "$typecheck_enabled" = "true" ] && [ "$run_mypy_enabled" = "true" ]; then
+            mypy_enabled="true"
+          fi
+
+          add_tool() {
+            specs+=("$1")
+            tools_installed+=("$2")
+          }
+
+          skip_tool() {
+            tools_skipped+=("$1")
+          }
+
+          if [ -n "${PRIVATE_PYPI_TOKEN:-}" ]; then
+            export PIP_INDEX_URL="https://__token__:${PRIVATE_PYPI_TOKEN}@pypi.org/simple"
+          fi
+          specs=()
+          tools_installed=()
+          tools_skipped=()
+
+          has_lock_file=false
+          if [ -f requirements.lock ]; then
+            has_lock_file=true
+          fi
+
+          if [ "$install_project_deps" = "true" ]; then
+            if [ -f requirements.lock ]; then
+              specs+=('-r' 'requirements.lock')
+            fi
+
+            if [ -f pyproject.toml ]; then
+              specs+=('-e' '.[app,dev]')
+            elif [ -f setup.cfg ] || [ -f setup.py ]; then
+              specs+=('-e' '.[app,dev]')
+            fi
+          fi
+
+          black_spec="black"
+          docformatter_spec="docformatter"
+          isort_spec="isort"
+          ruff_spec="ruff"
+          mypy_spec="mypy"
+          pytest_spec="pytest"
+          pytest_cov_spec="pytest-cov"
+          coverage_spec="coverage"
+          pytest_xdist_spec="pytest-xdist"
+          # Do not install heavyweight "baseline" test deps implicitly.
+          # Repos should declare their own runtime/test dependencies.
+
+          resolve_spec() {
+            local package=$1
+            local version=${2:-}
+            local default_version=${3:-}
+            if [ -n "$version" ]; then
+              echo "${package}==${version}"
+            elif [ -n "$default_version" ]; then
+              echo "${package}>=${default_version}"
+            else
+              echo "$package"
+            fi
+          }
+
+          autofix_env="${GITHUB_WORKSPACE}/.github/workflows/autofix-versions.env"
+          # Always honor tool pins when present. Lock files typically only capture runtime deps.
+          if [ -f "$autofix_env" ]; then
+            # shellcheck source=.github/workflows/autofix-versions.env
+            source "$autofix_env"
+            black_spec=$(resolve_spec "black" "${BLACK_VERSION:-}" "")
+            docformatter_spec=$(resolve_spec "docformatter" "${DOCFORMATTER_VERSION:-}" "")
+            isort_spec=$(resolve_spec "isort" "${ISORT_VERSION:-}" "")
+            ruff_spec=$(resolve_spec "ruff" "${RUFF_VERSION:-}" "")
+            mypy_spec=$(resolve_spec "mypy" "${MYPY_VERSION:-}" "")
+            pytest_spec=$(resolve_spec "pytest" "${PYTEST_VERSION:-}" "")
+            pytest_cov_spec=$(resolve_spec "pytest-cov" "${PYTEST_COV_VERSION:-}" "")
+            coverage_spec=$(resolve_spec "coverage" "${COVERAGE_VERSION:-}" "7.13.2")
+            pytest_xdist_spec=$(resolve_spec "pytest-xdist" "${PYTEST_XDIST_VERSION:-}" "3.6.1")
+          elif [ "$has_lock_file" = "false" ]; then
+            echo "Warning: autofix-versions.env not found, installing latest tool versions" >&2
+          fi
+
+          # Always install dev tools - lock files only contain runtime deps, not dev tools
+          if [ "$format_enabled" = "true" ]; then
+            add_tool "$black_spec" "black"
+            add_tool "$docformatter_spec" "docformatter"
+            add_tool "$isort_spec" "isort"
+          else
+            skip_tool "black (format_check disabled)"
+            skip_tool "docformatter (format_check disabled)"
+            skip_tool "isort (format_check disabled)"
+          fi
+
+          if [ "$lint_enabled" = "true" ]; then
+            add_tool "$ruff_spec" "ruff"
+          else
+            skip_tool "ruff (lint disabled)"
+          fi
+
+          if [ "$mypy_enabled" = "true" ]; then
+            add_tool "$mypy_spec" "mypy"
+          else
+            skip_tool "mypy (typecheck disabled)"
+          fi
+
+          add_tool "$pytest_spec" "pytest"
+          add_tool "$pytest_xdist_spec" "pytest-xdist"
+
+          if [ "$coverage_enabled" = "true" ]; then
+            add_tool "$pytest_cov_spec" "pytest-cov"
+            add_tool "$coverage_spec" "coverage"
+          else
+            skip_tool "pytest-cov (coverage disabled)"
+            skip_tool "coverage (coverage disabled)"
+          fi
+
+          if [ ${#specs[@]} -eq 0 ]; then
+            echo "No install targets found; skipping dependency installation."
+          else
+            uv pip install --system "${specs[@]}"
+          fi
+
+          end_ts=$(date +%s)
+          duration=$((end_ts - start_ts))
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            installed_label="none"
+            skipped_label="none"
+            if [ ${#tools_installed[@]} -gt 0 ]; then
+              installed_label=$(printf '%s, ' "${tools_installed[@]}")
+              installed_label=${installed_label%, }
+            fi
+            if [ ${#tools_skipped[@]} -gt 0 ]; then
+              skipped_label=$(printf '%s, ' "${tools_skipped[@]}")
+              skipped_label=${skipped_label%, }
+            fi
+            {
+              printf '## Dependency installation timing\n'
+              printf -- '- Duration: %ss\n' "$duration"
+              printf -- '- Tools installed: %s\n' "$installed_label"
+              printf -- '- Tools skipped (disabled): %s\n' "$skipped_label"
+              if [ ${#tools_skipped[@]} -gt 0 ]; then
+                printf -- '- Note: skipping %d tool(s) avoids extra setup time when disabled.\n' \
+                  "${#tools_skipped[@]}"
+              fi
+              req_hash=$(sha256sum requirements.lock 2>/dev/null | cut -d' ' -f1 || echo none)
+              pyproject_hash=$(sha256sum pyproject.toml 2>/dev/null | cut -d' ' -f1 || echo none)
+              printf -- '- Cache key: uv-%s-%s-%s-%s\n' \
+                "${{ runner.os }}" \
+                "$INPUT_PYTHON_VERSION" \
+                "$req_hash" \
+                "$pyproject_hash"
+            } >>"${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Black (format check)
+        id: black
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # Exclude .workflows-lib since it's synced from source repo with different config
+          black --check --line-length 100 --exclude '(\.workflows-lib|node_modules)' .
+
+      - name: Finalize format check
+        id: finalize
+        if: always()
+        env:
+          FORMAT_OUTCOME: ${{ steps.black.outcome || 'skipped' }}
+        run: |
+          set -euo pipefail
+          echo "outcome=${FORMAT_OUTCOME}" >> "${GITHUB_OUTPUT}"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            {
+              printf '## Format check\n'
+              printf -- '- Outcome: %s\n' "${FORMAT_OUTCOME}"
+            } >>"${GITHUB_STEP_SUMMARY}"
+          fi
+          if [ "${FORMAT_OUTCOME}" != "success" ] && [ "${FORMAT_OUTCOME}" != "skipped" ]; then
+            printf 'Format check failed with outcome: %s\n' "${FORMAT_OUTCOME}" >&2
+            exit 1
+          fi
+
+  lint-ruff:
+    name: lint-ruff
+    needs: validate-inputs
+    if: ${{ inputs.lint }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs['working-directory'] || '.' }}
+    env:
+      WORKDIR: ${{ inputs['working-directory'] || '.' }}
+      WORKSPACE_ROOT: ${{ github.workspace }}
+      PROJECT_ROOT: >-
+        ${{ inputs['working-directory'] != '' && inputs['working-directory'] != '.' &&
+        format('{0}/{1}', github.workspace, inputs['working-directory'])
+        || github.workspace }}
+    outputs:
+      lint_outcome: ${{ steps.finalize.outputs.outcome || steps.ruff.outcome || 'skipped' }}
+    steps:
+      - name: Checkout repository
+        if: ${{ inputs['working-directory'] == '' || inputs['working-directory'] == '.' }}
+        uses: actions/checkout@v6
+        with:
+          submodules: false
+          fetch-depth: 1
+      - name: Checkout repository (sparse)
+        if: ${{ inputs['working-directory'] != '' && inputs['working-directory'] != '.' }}
+        uses: actions/checkout@v6
+        with:
+          submodules: false
+          fetch-depth: 1
+          sparse-checkout: |
+            .github/workflows
+            scripts
+            tools
+            config
+            ${{ inputs['working-directory'] }}
+          sparse-checkout-cone-mode: true
+
+      # Inlined from .github/actions/python-ci-setup for external repo compatibility
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: >-
+            ${{
+              inputs['primary-python-version']
+              || inputs['python-version']
+              || '3.11'
+            }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Install uv
+        shell: bash
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Cache uv artifacts
+        if: ${{ inputs.cache }}
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cache/uv
+          key: >-
+            ${{ format(
+            'uv-{0}-{1}-{2}-{3}',
+            runner.os,
+            inputs['primary-python-version'] || inputs['python-version'] || '3.11',
+            hashFiles(format('{0}/requirements.lock', inputs['working-directory'] || '.')),
+            hashFiles(format('{0}/pyproject.toml', inputs['working-directory'] || '.'))
+            ) }}
+          restore-keys: |
+            uv-${{ runner.os }}-
+
+      - name: Install dependencies
+        shell: bash
+        working-directory: ${{ inputs['working-directory'] || '.' }}
+        env:
+          PRIVATE_PYPI_TOKEN: ${{ secrets.pypi-token }}
+          WORKDIR: ${{ inputs['working-directory'] || '.' }}
+          INPUT_LINT: ${{ inputs.lint }}
+          INPUT_FORMAT_CHECK: 'false'
+          INPUT_INSTALL_PROJECT_DEPS: 'false'
+          INPUT_TYPECHECK: 'false'
+          INPUT_RUN_MYPY: 'false'
+          INPUT_COVERAGE: 'false'
+          INPUT_PYTHON_VERSION: >-
+            ${{
+              inputs['primary-python-version']
+              || inputs['python-version']
+              || '3.11'
+            }}
+        run: |
+          set -euo pipefail
+          start_ts=$(date +%s)
+
+          to_bool() {
+            case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+              1|true|yes|y|on) echo "true" ;;
+              *) echo "false" ;;
+            esac
+          }
+
+          lint_enabled=$(to_bool "$INPUT_LINT")
+          format_enabled=$(to_bool "$INPUT_FORMAT_CHECK")
+          typecheck_enabled=$(to_bool "$INPUT_TYPECHECK")
+          run_mypy_enabled=$(to_bool "$INPUT_RUN_MYPY")
+          coverage_enabled=$(to_bool "$INPUT_COVERAGE")
+          install_project_deps=$(to_bool "${INPUT_INSTALL_PROJECT_DEPS:-true}")
+          mypy_enabled="false"
+          if [ "$typecheck_enabled" = "true" ] && [ "$run_mypy_enabled" = "true" ]; then
+            mypy_enabled="true"
+          fi
+
+          add_tool() {
+            specs+=("$1")
+            tools_installed+=("$2")
+          }
+
+          skip_tool() {
+            tools_skipped+=("$1")
+          }
+
+          if [ -n "${PRIVATE_PYPI_TOKEN:-}" ]; then
+            export PIP_INDEX_URL="https://__token__:${PRIVATE_PYPI_TOKEN}@pypi.org/simple"
+          fi
+          specs=()
+          tools_installed=()
+          tools_skipped=()
+
+          has_lock_file=false
+          if [ -f requirements.lock ]; then
+            has_lock_file=true
+          fi
+
+          if [ "$install_project_deps" = "true" ]; then
+            if [ -f requirements.lock ]; then
+              specs+=('-r' 'requirements.lock')
+            fi
+
+            if [ -f pyproject.toml ]; then
+              specs+=('-e' '.[app,dev]')
+            elif [ -f setup.cfg ] || [ -f setup.py ]; then
+              specs+=('-e' '.[app,dev]')
+            fi
+          fi
+
+          black_spec="black"
+          docformatter_spec="docformatter"
+          isort_spec="isort"
+          ruff_spec="ruff"
+          mypy_spec="mypy"
+          pytest_spec="pytest"
+          pytest_cov_spec="pytest-cov"
+          coverage_spec="coverage"
+          pytest_xdist_spec="pytest-xdist"
+          # Do not install heavyweight "baseline" test deps implicitly.
+          # Repos should declare their own runtime/test dependencies.
+
+          resolve_spec() {
+            local package=$1
+            local version=${2:-}
+            local default_version=${3:-}
+            if [ -n "$version" ]; then
+              echo "${package}==${version}"
+            elif [ -n "$default_version" ]; then
+              echo "${package}>=${default_version}"
+            else
+              echo "$package"
+            fi
+          }
+
+          autofix_env="${GITHUB_WORKSPACE}/.github/workflows/autofix-versions.env"
+          # Always honor tool pins when present. Lock files typically only capture runtime deps.
+          if [ -f "$autofix_env" ]; then
+            # shellcheck source=.github/workflows/autofix-versions.env
+            source "$autofix_env"
+            black_spec=$(resolve_spec "black" "${BLACK_VERSION:-}" "")
+            docformatter_spec=$(resolve_spec "docformatter" "${DOCFORMATTER_VERSION:-}" "")
+            isort_spec=$(resolve_spec "isort" "${ISORT_VERSION:-}" "")
+            ruff_spec=$(resolve_spec "ruff" "${RUFF_VERSION:-}" "")
+            mypy_spec=$(resolve_spec "mypy" "${MYPY_VERSION:-}" "")
+            pytest_spec=$(resolve_spec "pytest" "${PYTEST_VERSION:-}" "")
+            pytest_cov_spec=$(resolve_spec "pytest-cov" "${PYTEST_COV_VERSION:-}" "")
+            coverage_spec=$(resolve_spec "coverage" "${COVERAGE_VERSION:-}" "7.13.2")
+            pytest_xdist_spec=$(resolve_spec "pytest-xdist" "${PYTEST_XDIST_VERSION:-}" "3.6.1")
+          elif [ "$has_lock_file" = "false" ]; then
+            echo "Warning: autofix-versions.env not found, installing latest tool versions" >&2
+          fi
+
+          # Always install dev tools - lock files only contain runtime deps, not dev tools
+          if [ "$format_enabled" = "true" ]; then
+            add_tool "$black_spec" "black"
+            add_tool "$docformatter_spec" "docformatter"
+            add_tool "$isort_spec" "isort"
+          else
+            skip_tool "black (format_check disabled)"
+            skip_tool "docformatter (format_check disabled)"
+            skip_tool "isort (format_check disabled)"
+          fi
+
+          if [ "$lint_enabled" = "true" ]; then
+            add_tool "$ruff_spec" "ruff"
+          else
+            skip_tool "ruff (lint disabled)"
+          fi
+
+          if [ "$mypy_enabled" = "true" ]; then
+            add_tool "$mypy_spec" "mypy"
+          else
+            skip_tool "mypy (typecheck disabled)"
+          fi
+
+          add_tool "$pytest_spec" "pytest"
+          add_tool "$pytest_xdist_spec" "pytest-xdist"
+
+          if [ "$coverage_enabled" = "true" ]; then
+            add_tool "$pytest_cov_spec" "pytest-cov"
+            add_tool "$coverage_spec" "coverage"
+          else
+            skip_tool "pytest-cov (coverage disabled)"
+            skip_tool "coverage (coverage disabled)"
+          fi
+
+          if [ ${#specs[@]} -eq 0 ]; then
+            echo "No install targets found; skipping dependency installation."
+          else
+            uv pip install --system "${specs[@]}"
+          fi
+
+          end_ts=$(date +%s)
+          duration=$((end_ts - start_ts))
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            installed_label="none"
+            skipped_label="none"
+            if [ ${#tools_installed[@]} -gt 0 ]; then
+              installed_label=$(printf '%s, ' "${tools_installed[@]}")
+              installed_label=${installed_label%, }
+            fi
+            if [ ${#tools_skipped[@]} -gt 0 ]; then
+              skipped_label=$(printf '%s, ' "${tools_skipped[@]}")
+              skipped_label=${skipped_label%, }
+            fi
+            {
+              printf '## Dependency installation timing\n'
+              printf -- '- Duration: %ss\n' "$duration"
+              printf -- '- Tools installed: %s\n' "$installed_label"
+              printf -- '- Tools skipped (disabled): %s\n' "$skipped_label"
+              if [ ${#tools_skipped[@]} -gt 0 ]; then
+                printf -- '- Note: skipping %d tool(s) avoids extra setup time when disabled.\n' \
+                  "${#tools_skipped[@]}"
+              fi
+              req_hash=$(sha256sum requirements.lock 2>/dev/null | cut -d' ' -f1 || echo none)
+              pyproject_hash=$(sha256sum pyproject.toml 2>/dev/null | cut -d' ' -f1 || echo none)
+              printf -- '- Cache key: uv-%s-%s-%s-%s\n' \
+                "${{ runner.os }}" \
+                "$INPUT_PYTHON_VERSION" \
+                "$req_hash" \
+                "$pyproject_hash"
+            } >>"${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Ruff (lint)
+        id: ruff
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # Use extend-exclude to add to ruff's defaults (which include .venv)
+          # Exclude .workflows-lib since it's synced from source repo with different ruff config
+          ruff check --output-format github --extend-exclude .workflows-lib .
+
+      - name: Finalize lint
+        id: finalize
+        if: always()
+        env:
+          RUFF_OUTCOME: ${{ steps.ruff.outcome || 'skipped' }}
+        run: |
+          set -euo pipefail
+          echo "outcome=${RUFF_OUTCOME}" >> "${GITHUB_OUTPUT}"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            {
+              printf '## Ruff lint\n'
+              printf -- '- Outcome: %s\n' "${RUFF_OUTCOME}"
+            } >>"${GITHUB_STEP_SUMMARY}"
+          fi
+          if [ "${RUFF_OUTCOME}" != "success" ] && [ "${RUFF_OUTCOME}" != "skipped" ]; then
+            printf 'Ruff lint failed with outcome: %s\n' "${RUFF_OUTCOME}" >&2
+            exit 1
+          fi
+
+  typecheck-mypy:
+    name: typecheck-mypy
+    needs: validate-inputs
+    if: ${{ inputs.typecheck && inputs['run-mypy'] }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs['working-directory'] || '.' }}
+    env:
+      WORKDIR: ${{ inputs['working-directory'] || '.' }}
+      WORKSPACE_ROOT: ${{ github.workspace }}
+      PROJECT_ROOT: >-
+        ${{ inputs['working-directory'] != '' && inputs['working-directory'] != '.' &&
+        format('{0}/{1}', github.workspace, inputs['working-directory'])
+        || github.workspace }}
+    outputs:
+      mypy_outcome: ${{ steps.finalize.outputs.outcome || steps.mypy.outcome || 'skipped' }}
+    steps:
+      - name: Checkout repository
+        if: ${{ inputs['working-directory'] == '' || inputs['working-directory'] == '.' }}
+        uses: actions/checkout@v6
+        with:
+          submodules: false
+          fetch-depth: 1
+      - name: Checkout repository (sparse)
+        if: ${{ inputs['working-directory'] != '' && inputs['working-directory'] != '.' }}
+        uses: actions/checkout@v6
+        with:
+          submodules: false
+          fetch-depth: 1
+          sparse-checkout: |
+            .github/workflows
+            scripts
+            tools
+            config
+            ${{ inputs['working-directory'] }}
+          sparse-checkout-cone-mode: true
+
+      - name: Resolve mypy python pin
+        id: mypy-pin
+        env:
+          MATRIX_PYTHON_VERSION: >-
+            ${{
+              inputs['primary-python-version']
+              || inputs['python-version']
+              || '3.11'
+            }}
+        run: |
+          set -euo pipefail
+          python "${GITHUB_WORKSPACE}/tools/resolve_mypy_pin.py"
+
+      # Inlined from .github/actions/python-ci-setup for external repo compatibility
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: >-
+            ${{
+              steps.mypy-pin.outputs.python-version
+              || inputs['primary-python-version']
+              || inputs['python-version']
+              || '3.11'
+            }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Install uv
+        shell: bash
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Cache uv artifacts
+        if: ${{ inputs.cache }}
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cache/uv
+          key: >-
+            ${{ format(
+            'uv-{0}-{1}-{2}-{3}',
+            runner.os,
+            steps.mypy-pin.outputs.python-version,
+            hashFiles(format('{0}/requirements.lock', inputs['working-directory'] || '.')),
+            hashFiles(format('{0}/pyproject.toml', inputs['working-directory'] || '.'))
+            ) }}
+          restore-keys: |
+            uv-${{ runner.os }}-
+
+      - name: Install dependencies
+        shell: bash
+        working-directory: ${{ inputs['working-directory'] || '.' }}
+        env:
+          PRIVATE_PYPI_TOKEN: ${{ secrets.pypi-token }}
+          WORKDIR: ${{ inputs['working-directory'] || '.' }}
+          INPUT_LINT: 'false'
+          INPUT_FORMAT_CHECK: 'false'
+          INPUT_TYPECHECK: ${{ inputs.typecheck }}
+          INPUT_RUN_MYPY: ${{ inputs['run-mypy'] }}
+          INPUT_COVERAGE: 'false'
+          INPUT_PYTHON_VERSION: >-
+            ${{
+              steps.mypy-pin.outputs.python-version
+              || inputs['primary-python-version']
+              || inputs['python-version']
+              || '3.11'
+            }}
+        run: |
+          set -euo pipefail
+          start_ts=$(date +%s)
+
+          to_bool() {
+            case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+              1|true|yes|y|on) echo "true" ;;
+              *) echo "false" ;;
+            esac
+          }
+
+          lint_enabled=$(to_bool "$INPUT_LINT")
+          format_enabled=$(to_bool "$INPUT_FORMAT_CHECK")
+          typecheck_enabled=$(to_bool "$INPUT_TYPECHECK")
+          run_mypy_enabled=$(to_bool "$INPUT_RUN_MYPY")
+          coverage_enabled=$(to_bool "$INPUT_COVERAGE")
+          mypy_enabled="false"
+          if [ "$typecheck_enabled" = "true" ] && [ "$run_mypy_enabled" = "true" ]; then
+            mypy_enabled="true"
+          fi
+
+          add_tool() {
+            specs+=("$1")
+            tools_installed+=("$2")
+          }
+
+          skip_tool() {
+            tools_skipped+=("$1")
+          }
+
+          if [ -n "${PRIVATE_PYPI_TOKEN:-}" ]; then
+            export PIP_INDEX_URL="https://__token__:${PRIVATE_PYPI_TOKEN}@pypi.org/simple"
+          fi
+          specs=()
+          tools_installed=()
+          tools_skipped=()
+
+          has_lock_file=false
+          if [ -f requirements.lock ]; then
+            has_lock_file=true
+            specs+=('-r' 'requirements.lock')
+          fi
+
+          if [ -f pyproject.toml ]; then
+            specs+=('-e' '.[app,dev]')
+          elif [ -f setup.cfg ] || [ -f setup.py ]; then
+            specs+=('-e' '.[app,dev]')
+          fi
+
+          black_spec="black"
+          docformatter_spec="docformatter"
+          isort_spec="isort"
+          ruff_spec="ruff"
+          mypy_spec="mypy"
+          pytest_spec="pytest"
+          pytest_cov_spec="pytest-cov"
+          coverage_spec="coverage"
+          pytest_xdist_spec="pytest-xdist"
+          # Do not install heavyweight "baseline" test deps implicitly.
+          # Repos should declare their own runtime/test dependencies.
+
+          resolve_spec() {
+            local package=$1
+            local version=${2:-}
+            local default_version=${3:-}
+            if [ -n "$version" ]; then
+              echo "${package}==${version}"
+            elif [ -n "$default_version" ]; then
+              echo "${package}>=${default_version}"
+            else
+              echo "$package"
+            fi
+          }
+
+          autofix_env="${GITHUB_WORKSPACE}/.github/workflows/autofix-versions.env"
+          # Always honor tool pins when present. Lock files typically only capture runtime deps.
+          if [ -f "$autofix_env" ]; then
+            # shellcheck source=.github/workflows/autofix-versions.env
+            source "$autofix_env"
+            black_spec=$(resolve_spec "black" "${BLACK_VERSION:-}" "")
+            docformatter_spec=$(resolve_spec "docformatter" "${DOCFORMATTER_VERSION:-}" "")
+            isort_spec=$(resolve_spec "isort" "${ISORT_VERSION:-}" "")
+            ruff_spec=$(resolve_spec "ruff" "${RUFF_VERSION:-}" "")
+            mypy_spec=$(resolve_spec "mypy" "${MYPY_VERSION:-}" "")
+            pytest_spec=$(resolve_spec "pytest" "${PYTEST_VERSION:-}" "")
+            pytest_cov_spec=$(resolve_spec "pytest-cov" "${PYTEST_COV_VERSION:-}" "")
+            coverage_spec=$(resolve_spec "coverage" "${COVERAGE_VERSION:-}" "7.13.2")
+            pytest_xdist_spec=$(resolve_spec "pytest-xdist" "${PYTEST_XDIST_VERSION:-}" "3.6.1")
+          elif [ "$has_lock_file" = "false" ]; then
+            echo "Warning: autofix-versions.env not found, installing latest tool versions" >&2
+          fi
+
+          # Always install dev tools - lock files only contain runtime deps, not dev tools
+          if [ "$format_enabled" = "true" ]; then
+            add_tool "$black_spec" "black"
+            add_tool "$docformatter_spec" "docformatter"
+            add_tool "$isort_spec" "isort"
+          else
+            skip_tool "black (format_check disabled)"
+            skip_tool "docformatter (format_check disabled)"
+            skip_tool "isort (format_check disabled)"
+          fi
+
+          if [ "$lint_enabled" = "true" ]; then
+            add_tool "$ruff_spec" "ruff"
+          else
+            skip_tool "ruff (lint disabled)"
+          fi
+
+          if [ "$mypy_enabled" = "true" ]; then
+            add_tool "$mypy_spec" "mypy"
+          else
+            skip_tool "mypy (typecheck disabled)"
+          fi
+
+          add_tool "$pytest_spec" "pytest"
+          add_tool "$pytest_xdist_spec" "pytest-xdist"
+
+          if [ "$coverage_enabled" = "true" ]; then
+            add_tool "$pytest_cov_spec" "pytest-cov"
+            add_tool "$coverage_spec" "coverage"
+          else
+            skip_tool "pytest-cov (coverage disabled)"
+            skip_tool "coverage (coverage disabled)"
+          fi
+
+          if [ ${#specs[@]} -eq 0 ]; then
+            echo "No install targets found; skipping dependency installation."
+          else
+            uv pip install --system "${specs[@]}"
+          fi
+
+          end_ts=$(date +%s)
+          duration=$((end_ts - start_ts))
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            installed_label="none"
+            skipped_label="none"
+            if [ ${#tools_installed[@]} -gt 0 ]; then
+              installed_label=$(printf '%s, ' "${tools_installed[@]}")
+              installed_label=${installed_label%, }
+            fi
+            if [ ${#tools_skipped[@]} -gt 0 ]; then
+              skipped_label=$(printf '%s, ' "${tools_skipped[@]}")
+              skipped_label=${skipped_label%, }
+            fi
+            {
+              printf '## Dependency installation timing\n'
+              printf -- '- Duration: %ss\n' "$duration"
+              printf -- '- Tools installed: %s\n' "$installed_label"
+              printf -- '- Tools skipped (disabled): %s\n' "$skipped_label"
+              if [ ${#tools_skipped[@]} -gt 0 ]; then
+                printf -- '- Note: skipping %d tool(s) avoids extra setup time when disabled.\n' \
+                  "${#tools_skipped[@]}"
+              fi
+              req_hash=$(sha256sum requirements.lock 2>/dev/null | cut -d' ' -f1 || echo none)
+              pyproject_hash=$(sha256sum pyproject.toml 2>/dev/null | cut -d' ' -f1 || echo none)
+              printf -- '- Cache key: uv-%s-%s-%s-%s\n' \
+                "${{ runner.os }}" \
+                "$INPUT_PYTHON_VERSION" \
+                "$req_hash" \
+                "$pyproject_hash"
+            } >>"${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Cache mypy state
+        if: ${{ inputs.cache }}
+        uses: actions/cache@v5
+        with:
+          path: ${{ inputs['working-directory'] || '.' }}/.mypy_cache
+          key: >-
+            mypy-${{ runner.os }}
+            -${{ steps.mypy-pin.outputs.python-version }}
+            -${{ hashFiles(format('{0}/pyproject.toml', inputs['working-directory'])) }}
+            -${{ hashFiles(format('{0}/src/**/*.py', inputs['working-directory'])) }}
+          restore-keys: |
+            mypy-${{ runner.os }}-${{ steps.mypy-pin.outputs.python-version }}-
+            mypy-${{ runner.os }}-
+
+      - name: Mypy (type check)
+        id: mypy
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          args=()
+          if [ -f pyproject.toml ]; then
+            args+=("--config-file" "pyproject.toml")
+          fi
+          # Exclude .workflows-lib (synced from source repo with different config)
+          args+=("--exclude" ".workflows-lib")
+          target="src"
+          if [ ! -d "$target" ]; then
+            target="."
+          fi
+          mypy "${args[@]}" "$target"
+
+      - name: Finalize mypy
+        id: finalize
+        if: always()
+        env:
+          MYPY_OUTCOME: ${{ steps.mypy.outcome || 'skipped' }}
+        run: |
+          set -euo pipefail
+          echo "outcome=${MYPY_OUTCOME}" >> "${GITHUB_OUTPUT}"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            {
+              printf '## Mypy\n'
+              printf -- '- Outcome: %s\n' "${MYPY_OUTCOME}"
+            } >>"${GITHUB_STEP_SUMMARY}"
+          fi
+          if [ "${MYPY_OUTCOME}" != "success" ] && [ "${MYPY_OUTCOME}" != "skipped" ]; then
+            printf 'Mypy failed with outcome: %s\n' "${MYPY_OUTCOME}" >&2
+            exit 1
+          fi
+
+  tests:
+    name: python ${{ matrix.python-version }}
+    needs: validate-inputs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      pytest_outcome: ${{ steps.finalize-tests.outputs.pytest_outcome || 'skipped' }}
+      coverage_min_outcome: ${{ steps.finalize-tests.outputs.coverage_min_outcome || 'skipped' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Callers using bracket notation must provide a valid JSON array; the
+        # matrix load will fail at runtime if the value cannot be parsed.
+        # Callers supplying a single version string must omit brackets;
+        # malformed values will be wrapped and passed through as-is.
+        python-version: >-
+          ${{ fromJson(
+            (
+              (
+                inputs['python-versions'] != '' &&
+                inputs['python-versions'] != '[]' &&
+                contains(inputs['python-versions'], '[')
+              )
+              && inputs['python-versions']
+            )
+            || (
+              (
+                inputs['python-versions'] != '' &&
+                inputs['python-versions'] != '[]' &&
+                !contains(inputs['python-versions'], '[')
+              )
+              && format('[{0}]', toJson(inputs['python-versions']))
+            )
+            || (
+              (
+                inputs['python-version'] != ''
+              )
+              && format('[{0}]', toJson(inputs['python-version']))
+            )
+            || '["3.11"]'
+          ) }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs['working-directory'] || '.' }}
+    env:
+      WORKDIR: ${{ inputs['working-directory'] || '.' }}
+      WORKSPACE_ROOT: ${{ github.workspace }}
+      PROJECT_ROOT: >-
+        ${{ inputs['working-directory'] != '' && inputs['working-directory'] != '.' &&
+        format('{0}/{1}', github.workspace, inputs['working-directory'])
+        || github.workspace }}
+    steps:
+      # Mint GitHub App token early to use for API calls (avoids rate limits)
+      - name: Mint GitHub App Token
+        id: app_token
+        uses: actions/create-github-app-token@v2
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.WORKFLOWS_APP_ID || '0' }}
+          private-key: ${{ secrets.WORKFLOWS_APP_PRIVATE_KEY || 'dummy' }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Checkout repository
+        if: ${{ inputs['working-directory'] == '' || inputs['working-directory'] == '.' }}
+        uses: actions/checkout@v6
+        with:
+          submodules: false
+          fetch-depth: 1  # Shallow clone for faster checkout
+      - name: Checkout repository (sparse)
+        if: ${{ inputs['working-directory'] != '' && inputs['working-directory'] != '.' }}
+        uses: actions/checkout@v6
+        with:
+          submodules: false
+          fetch-depth: 1  # Shallow clone for faster checkout
+          sparse-checkout: |
+            .github/workflows
+            scripts
+            tools
+            config
+            ${{ inputs['working-directory'] }}
+          sparse-checkout-cone-mode: true
+
+      # Inlined from .github/actions/python-ci-setup for external repo compatibility
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Install uv
+        shell: bash
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Cache uv artifacts
+        if: ${{ inputs.cache }}
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cache/uv
+          key: >-
+            ${{ format(
+            'uv-{0}-{1}-{2}-{3}',
+            runner.os,
+            matrix.python-version,
+            hashFiles(format('{0}/requirements.lock', inputs['working-directory'] || '.')),
+            hashFiles(format('{0}/pyproject.toml', inputs['working-directory'] || '.'))
+            ) }}
+          restore-keys: |
+            uv-${{ runner.os }}-${{ matrix.python-version }}-
+            uv-${{ runner.os }}-
+
+      - name: Install dependencies
+        shell: bash
+        working-directory: ${{ inputs['working-directory'] || '.' }}
+        env:
+          PRIVATE_PYPI_TOKEN: ${{ secrets.pypi-token }}
+          WORKDIR: ${{ inputs['working-directory'] || '.' }}
+          INPUT_LINT: 'false'
+          INPUT_FORMAT_CHECK: 'false'
+          INPUT_TYPECHECK: 'false'
+          INPUT_RUN_MYPY: 'false'
+          INPUT_COVERAGE: ${{ inputs.coverage }}
+          INPUT_PYTHON_VERSION: ${{ matrix.python-version }}
+        run: |
+          set -euo pipefail
+          start_ts=$(date +%s)
+
+          to_bool() {
+            case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+              1|true|yes|y|on) echo "true" ;;
+              *) echo "false" ;;
+            esac
+          }
+
+          lint_enabled=$(to_bool "$INPUT_LINT")
+          format_enabled=$(to_bool "$INPUT_FORMAT_CHECK")
+          typecheck_enabled=$(to_bool "$INPUT_TYPECHECK")
+          run_mypy_enabled=$(to_bool "$INPUT_RUN_MYPY")
+          coverage_enabled=$(to_bool "$INPUT_COVERAGE")
+          mypy_enabled="false"
+          if [ "$typecheck_enabled" = "true" ] && [ "$run_mypy_enabled" = "true" ]; then
+            mypy_enabled="true"
+          fi
+
+          add_tool() {
+            specs+=("$1")
+            tools_installed+=("$2")
+          }
+
+          skip_tool() {
+            tools_skipped+=("$1")
+          }
+
+          if [ -n "${PRIVATE_PYPI_TOKEN:-}" ]; then
+            export PIP_INDEX_URL="https://__token__:${PRIVATE_PYPI_TOKEN}@pypi.org/simple"
+          fi
+          specs=()
+          tools_installed=()
+          tools_skipped=()
+
+          has_lock_file=false
+          if [ -f requirements.lock ]; then
+            has_lock_file=true
+            specs+=('-r' 'requirements.lock')
+          fi
+
+          if [ -f pyproject.toml ]; then
+            specs+=('-e' '.[app,dev]')
+          elif [ -f setup.cfg ] || [ -f setup.py ]; then
+            specs+=('-e' '.[app,dev]')
+          fi
+
+          black_spec="black"
+          docformatter_spec="docformatter"
+          isort_spec="isort"
+          ruff_spec="ruff"
+          mypy_spec="mypy"
+          pytest_spec="pytest"
+          pytest_cov_spec="pytest-cov"
+          coverage_spec="coverage"
+          pytest_xdist_spec="pytest-xdist"
+          # Do not install heavyweight "baseline" test deps implicitly.
+          # Repos should declare their own runtime/test dependencies.
+
+          resolve_spec() {
+            local package=$1
+            local version=${2:-}
+            local default_version=${3:-}
+            if [ -n "$version" ]; then
+              echo "${package}==${version}"
+            elif [ -n "$default_version" ]; then
+              echo "${package}>=${default_version}"
+            else
+              echo "$package"
+            fi
+          }
+
+          autofix_env="${GITHUB_WORKSPACE}/.github/workflows/autofix-versions.env"
+          # Always honor tool pins when present. Lock files typically only capture runtime deps.
+          if [ -f "$autofix_env" ]; then
+            # shellcheck source=.github/workflows/autofix-versions.env
+            source "$autofix_env"
+            black_spec=$(resolve_spec "black" "${BLACK_VERSION:-}" "")
+            docformatter_spec=$(resolve_spec "docformatter" "${DOCFORMATTER_VERSION:-}" "")
+            isort_spec=$(resolve_spec "isort" "${ISORT_VERSION:-}" "")
+            ruff_spec=$(resolve_spec "ruff" "${RUFF_VERSION:-}" "")
+            mypy_spec=$(resolve_spec "mypy" "${MYPY_VERSION:-}" "")
+            pytest_spec=$(resolve_spec "pytest" "${PYTEST_VERSION:-}" "")
+            pytest_cov_spec=$(resolve_spec "pytest-cov" "${PYTEST_COV_VERSION:-}" "")
+            coverage_spec=$(resolve_spec "coverage" "${COVERAGE_VERSION:-}" "7.13.2")
+            pytest_xdist_spec=$(resolve_spec "pytest-xdist" "${PYTEST_XDIST_VERSION:-}" "3.6.1")
+          elif [ "$has_lock_file" = "false" ]; then
+            echo "Warning: autofix-versions.env not found, installing latest tool versions" >&2
+          fi
+
+          # Always install dev tools - lock files only contain runtime deps, not dev tools
+          if [ "$format_enabled" = "true" ]; then
+            add_tool "$black_spec" "black"
+            add_tool "$docformatter_spec" "docformatter"
+            add_tool "$isort_spec" "isort"
+          else
+            skip_tool "black (format_check disabled)"
+            skip_tool "docformatter (format_check disabled)"
+            skip_tool "isort (format_check disabled)"
+          fi
+
+          if [ "$mypy_enabled" = "true" ]; then
+            add_tool "$mypy_spec" "mypy"
+          else
+            skip_tool "mypy (typecheck disabled)"
+          fi
+
+          if [ "$lint_enabled" = "true" ]; then
+            add_tool "$ruff_spec" "ruff"
+          else
+            skip_tool "ruff (lint disabled)"
+          fi
+
+          add_tool "$pytest_spec" "pytest"
+          add_tool "$pytest_xdist_spec" "pytest-xdist"
+
+          if [ "$coverage_enabled" = "true" ]; then
+            add_tool "$pytest_cov_spec" "pytest-cov"
+            add_tool "$coverage_spec" "coverage"
+          else
+            skip_tool "pytest-cov (coverage disabled)"
+            skip_tool "coverage (coverage disabled)"
+          fi
+
+          if [ ${#specs[@]} -eq 0 ]; then
+            echo "No install targets found; skipping dependency installation."
+          else
+            uv pip install --system "${specs[@]}"
+          fi
+
+          end_ts=$(date +%s)
+          duration=$((end_ts - start_ts))
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            installed_label="none"
+            skipped_label="none"
+            if [ ${#tools_installed[@]} -gt 0 ]; then
+              installed_label=$(printf '%s, ' "${tools_installed[@]}")
+              installed_label=${installed_label%, }
+            fi
+            if [ ${#tools_skipped[@]} -gt 0 ]; then
+              skipped_label=$(printf '%s, ' "${tools_skipped[@]}")
+              skipped_label=${skipped_label%, }
+            fi
+            {
+              printf '## Dependency installation timing\n'
+              printf -- '- Duration: %ss\n' "$duration"
+              printf -- '- Tools installed: %s\n' "$installed_label"
+              printf -- '- Tools skipped (disabled): %s\n' "$skipped_label"
+              if [ ${#tools_skipped[@]} -gt 0 ]; then
+                printf -- '- Note: skipping %d tool(s) avoids extra setup time when disabled.\n' \
+                  "${#tools_skipped[@]}"
+              fi
+              req_hash=$(sha256sum requirements.lock 2>/dev/null | cut -d' ' -f1 || echo none)
+              pyproject_hash=$(sha256sum pyproject.toml 2>/dev/null | cut -d' ' -f1 || echo none)
+              printf -- '- Cache key: uv-%s-%s-%s-%s\n' \
+                "${{ runner.os }}" \
+                "$INPUT_PYTHON_VERSION" \
+                "$req_hash" \
+                "$pyproject_hash"
+            } >>"${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Validate test dependencies
+        id: test-deps
+        run: |
+          set -euo pipefail
+          summary_file="${GITHUB_STEP_SUMMARY:-}"
+
+          append_summary() {
+            if [ -n "$summary_file" ]; then
+              printf '%s\n' "$1" >>"$summary_file"
+            else
+              printf '%s\n' "$1"
+            fi
+          }
+
+          run_to_summary() {
+            if [ -n "$summary_file" ]; then
+              "$@" >>"$summary_file" 2>&1
+            else
+              "$@" 2>&1
+            fi
+          }
+
+          append_summary "## Test Dependency Validation"
+          append_summary ""
+
+          # Run the dependency check script if it exists
+          if [ -f "${GITHUB_WORKSPACE}/scripts/check_test_dependencies.sh" ]; then
+            append_summary "Running dependency check script..."
+            run_to_summary "${GITHUB_WORKSPACE}/scripts/check_test_dependencies.sh" || true
+          else
+            append_summary "⚠️ Dependency check script not found, running basic validation"
+            append_summary ""
+
+            # Basic Python version check
+            python_version=$(python --version 2>&1 | awk '{print $2}')
+            append_summary "✓ Python ${python_version}"
+
+            # Check key test packages
+            for pkg in pytest coverage hypothesis pandas numpy pydantic yaml requests jsonschema; do
+              if python -c "import ${pkg}" 2>/dev/null; then
+                append_summary "✓ ${pkg}"
+              else
+                append_summary "✗ ${pkg} (missing)"
+              fi
+            done
+
+            # Check optional tools
+            append_summary ""
+            append_summary "### Optional Tools"
+            for tool in node npm uv; do
+              if command -v "$tool" &>/dev/null; then
+                version=$("$tool" --version 2>&1 | head -n1 || echo "unknown")
+                append_summary "✓ ${tool} (${version})"
+              else
+                append_summary "○ ${tool} (not installed - some tests may skip)"
+              fi
+            done
+          fi
+
+      - name: Check for undeclared test dependencies
+        id: check-deps
+        continue-on-error: true
+        run: |
+          python "${GITHUB_WORKSPACE}/scripts/sync_test_dependencies.py" --verify
+
+      - name: Auto-fix missing dependencies
+        if: steps.check-deps.outcome == 'failure'
+        run: |
+          summary_file="${GITHUB_STEP_SUMMARY:-}"
+          append_summary() {
+            if [ -n "$summary_file" ]; then
+              printf '%s\n' "$1" >>"$summary_file"
+            else
+              printf '%s\n' "$1"
+            fi
+          }
+
+          append_summary "⚠️ Found undeclared test dependencies. Auto-fixing..."
+          if [ -n "$summary_file" ]; then
+            python "${GITHUB_WORKSPACE}/scripts/sync_test_dependencies.py" --fix >>"$summary_file"
+          else
+            python "${GITHUB_WORKSPACE}/scripts/sync_test_dependencies.py" --fix
+          fi
+          append_summary ""
+          append_summary "📝 Updated pyproject.toml with missing dependencies."
+          append_summary "⚠️ Build will fail - commit the updated pyproject.toml and"
+          append_summary "regenerate requirements.lock"
+          exit 1
+
+      - name: Resolve mypy python pin
+        if: ${{ inputs.typecheck && inputs['run-mypy'] }}
+        id: mypy-pin
+        env:
+          MATRIX_PYTHON_VERSION: ${{ matrix.python-version }}
+        run: |
+          set -euo pipefail
+          python "${GITHUB_WORKSPACE}/tools/resolve_mypy_pin.py"
+
+      - name: Cache mypy state
+        if: ${{ inputs.cache && inputs.typecheck && inputs['run-mypy'] }}
+        uses: actions/cache@v5
+        with:
+          path: ${{ inputs['working-directory'] || '.' }}/.mypy_cache
+          key: >-
+            mypy-${{ runner.os }}
+            -${{ matrix.python-version }}
+            -${{ hashFiles(format('{0}/pyproject.toml', inputs['working-directory'])) }}
+            -${{ hashFiles(format('{0}/src/**/*.py', inputs['working-directory'])) }}
+          restore-keys: |
+            mypy-${{ runner.os }}-${{ matrix.python-version }}-
+            mypy-${{ runner.os }}-
+
+      - name: Cache pytest state
+        if: ${{ inputs.cache }}
+        uses: actions/cache@v5
+        with:
+          path: ${{ inputs['working-directory'] || '.' }}/.pytest_cache
+          key: >-
+            pytest-${{ runner.os }}
+            -${{ matrix.python-version }}
+            -${{ hashFiles(format('{0}/pyproject.toml', inputs['working-directory'])) }}
+            -${{ hashFiles(format('{0}/requirements.lock', inputs['working-directory'])) }}
+          restore-keys: |
+            pytest-${{ runner.os }}-${{ matrix.python-version }}-
+            pytest-${{ runner.os }}-
+      - name: Pytest (unit tests with coverage)
+        id: pytest
+        continue-on-error: true
+        working-directory: ${{ inputs['working-directory'] || '.' }}
+        env:
+          PYTEST_MARKERS: >-
+            ${{
+              inputs.pytest_markers != ''
+              && inputs.pytest_markers
+              || inputs.marker
+            }}
+          PYTEST_ARGS: ${{ inputs['pytest_args'] || '' }}
+          COVERAGE_ENABLED: ${{ inputs.coverage }}
+          PYTHONPATH: ${{ github.workspace }}/${{ inputs['working-directory'] || '.' }}
+        run: |
+          set -euo pipefail
+          coverage_target="src"
+          if [ ! -d "$coverage_target" ]; then
+            coverage_target="."
+          fi
+          args=("--junitxml=pytest-junit.xml")
+          if [ "${COVERAGE_ENABLED}" = "true" ]; then
+            args+=("--cov=${coverage_target}")
+            args+=("--cov-report=xml:coverage.xml")
+            args+=("--cov-report=term-missing")
+            args+=("--cov-report=json:coverage.json")
+          fi
+          if [ -n "${PYTEST_MARKERS}" ]; then
+            args=("-m" "${PYTEST_MARKERS}" "${args[@]}")
+          fi
+          if [ -n "${PYTEST_ARGS}" ]; then
+            mapfile -t extra_args < <(
+              python -c \
+                'import os, shlex; print(*shlex.split(os.getenv("PYTEST_ARGS", "")), sep="\n")'
+            )
+            if [ ${#extra_args[@]} -gt 0 ]; then
+              args+=("${extra_args[@]}")
+            fi
+          fi
+          if python -c "import xdist" 2>/dev/null; then
+            args+=("-n" "auto" "--dist=loadgroup")
+            echo "Running tests in parallel with pytest-xdist (loadgroup scheduler)..."
+          fi
+          pytest "${args[@]}"
+      - name: Enforce coverage minimum
+        id: coverage_min
+        if: ${{ inputs.coverage && inputs['coverage-min'] != '' }}
+        continue-on-error: true
+        run: |
+          python - <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          target = float("${{ inputs['coverage-min'] }}")
+          path = Path("coverage.xml")
+          if not path.is_file():
+            print("coverage.xml not found", file=sys.stderr)
+            sys.exit(1)
+          rate_attr = ET.parse(path).getroot().get("line-rate")
+          if rate_attr is None:
+            print("coverage.xml missing line-rate attribute", file=sys.stderr)
+            sys.exit(1)
+          rate = float(rate_attr) * 100.0
+          if rate + 1e-6 < target:
+            print(f"Coverage {rate:.2f}% below minimum {target:.2f}%", file=sys.stderr)
+            sys.exit(1)
+          print(f"Coverage {rate:.2f}% meets minimum {target:.2f}%")
+          PY
+
+      - name: Stage coverage artifact layout
+        if: always()
+        env:
+          COVERAGE_ENABLED: ${{ inputs.coverage }}
+        run: |
+          set -euo pipefail
+          runtime="${{ matrix.python-version }}"
+          base_dir="artifacts/coverage/runtimes/${runtime}"
+
+          rm -rf "${base_dir}"
+          mkdir -p "${base_dir}"
+
+          mkdir -p "artifacts/coverage"
+
+          copied=0
+          if [ "${COVERAGE_ENABLED}" = "true" ] && [ -f coverage.xml ]; then
+            cp coverage.xml "${base_dir}/coverage.xml"
+            copied=1
+          fi
+
+          if [ "${COVERAGE_ENABLED}" = "true" ] && [ -f coverage.json ]; then
+            cp coverage.json "${base_dir}/coverage.json"
+            copied=1
+          fi
+
+          if [ -f pytest-junit.xml ]; then
+            cp pytest-junit.xml "${base_dir}/pytest-junit.xml"
+            copied=1
+          fi
+
+          if [ "${copied}" -eq 0 ]; then
+            rm -rf "${base_dir}"
+            echo "No coverage payloads found; skipping staging."
+          fi
+
+      - name: Record CI summary
+        if: always()
+        id: ci-summary
+        env:
+          PYTHON_VERSION: ${{ matrix.python-version }}
+          PYTEST_OUTCOME: ${{ steps.pytest.outcome || 'skipped' }}
+          COVERAGE_MIN_OUTCOME: ${{ steps.coverage_min.outcome || 'skipped' }}
+          COVERAGE_ENABLED: ${{ inputs.coverage }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          runtime = os.environ.get("PYTHON_VERSION", "unknown")
+          base_dir = Path("artifacts/coverage/runtimes") / runtime
+          base_dir.mkdir(parents=True, exist_ok=True)
+
+          xml_path = base_dir / "coverage.xml"
+          json_path = base_dir / "coverage.json"
+          coverage_value: float | None = None
+
+          def normalize(value: str | None) -> str:
+              return (value or "skipped").lower()
+
+          summary: dict[str, object] = {
+              "python_version": runtime,
+              "checks": {
+                "tests": {
+                  "tool": "pytest",
+                  "outcome": normalize(os.environ.get("PYTEST_OUTCOME")),
+                },
+                  "coverage_minimum": {
+                      "tool": "threshold",
+                      "outcome": normalize(os.environ.get("COVERAGE_MIN_OUTCOME")),
+                  },
+              },
+              "artifacts": {
+                  "coverage_xml": xml_path.exists(),
+                  "coverage_json": json_path.exists(),
+                  "pytest_junit": (base_dir / "pytest-junit.xml").exists(),
+              },
+          }
+
+          if xml_path.exists():
+              try:
+                  rate = ET.parse(xml_path).getroot().get("line-rate")
+                  if rate is not None:
+                      coverage_value = float(rate) * 100.0
+              except ET.ParseError:
+                  coverage_value = None
+          if coverage_value is None and json_path.exists():
+              try:
+                  data = json.loads(json_path.read_text(encoding="utf-8"))
+              except json.JSONDecodeError:
+                  data = None
+              if isinstance(data, dict):
+                  totals = data.get("totals")
+                  if isinstance(totals, dict):
+                      percent = totals.get("percent_covered")
+                      if isinstance(percent, (int, float)):
+                          coverage_value = float(percent)
+
+          if coverage_value is not None:
+              summary["coverage"] = {
+                  "percent": round(float(coverage_value), 2),
+                  "source": "coverage.json" if json_path.exists() else "coverage.xml",
+              }
+
+          summary_path = base_dir / "summary.json"
+          summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+
+          index_path = Path("artifacts/coverage/index.ndjson")
+          index_path.parent.mkdir(parents=True, exist_ok=True)
+          with index_path.open("a", encoding="utf-8") as handle:
+              handle.write(json.dumps(summary) + "\n")
+
+          output_path = Path(os.environ.get("GITHUB_OUTPUT", ""))
+          if output_path:
+              with output_path.open("a", encoding="utf-8") as handle:
+                  handle.write(f"summary_path={summary_path}\n")
+          PY
+
+      - name: Record staged artifact paths
+        if: always()
+        id: coverage_paths
+        env:
+          PYTHON_VERSION: ${{ matrix.python-version }}
+          COVERAGE_ENABLED: ${{ inputs.coverage }}
+          SUMMARY_PATH: ${{ steps.ci-summary.outputs.summary_path }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          runtime = os.environ.get("PYTHON_VERSION", "unknown")
+          coverage_enabled = os.environ.get("COVERAGE_ENABLED", "false").lower() == "true"
+          base_dir = Path("artifacts/coverage/runtimes") / runtime
+          coverage_json = base_dir / "coverage.json"
+          coverage_xml = base_dir / "coverage.xml"
+          junit_path = base_dir / "pytest-junit.xml"
+          fallback_json = Path("coverage.json")
+          fallback_junit = Path("pytest-junit.xml")
+          summary_env = os.environ.get("SUMMARY_PATH") or ""
+          summary_path = Path(summary_env) if summary_env else None
+
+          outputs: dict[str, str] = {
+              "coverage_json": "",
+              "junit_path": "",
+              "summary_path": "",
+          }
+
+          if coverage_json.exists():
+              outputs["coverage_json"] = str(coverage_json)
+          elif coverage_enabled and fallback_json.exists():
+              outputs["coverage_json"] = str(fallback_json)
+
+          if junit_path.exists():
+              outputs["junit_path"] = str(junit_path)
+          elif fallback_junit.exists():
+              outputs["junit_path"] = str(fallback_junit)
+
+          if summary_path and summary_path.exists():
+              outputs["summary_path"] = str(summary_path)
+
+          has_payload = False
+          if base_dir.exists():
+              has_payload = any(child.is_file() for child in base_dir.glob("*"))
+          if not has_payload and fallback_junit.exists():
+              has_payload = True
+          if not has_payload and summary_path and summary_path.exists():
+              has_payload = True
+
+          output_path = Path(os.environ.get("GITHUB_OUTPUT", ""))
+          if output_path:
+              with output_path.open("a", encoding="utf-8") as handle:
+                  for key, value in outputs.items():
+                      handle.write(f"{key}={value}\n")
+                  handle.write(f"has_payload={'true' if has_payload else 'false'}\n")
+          PY
+
+      - name: Upload coverage artifact
+        if: ${{ always() && steps.coverage_paths.outputs.has_payload == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: >-
+            ${{ inputs['artifact-prefix'] }}coverage-${{ matrix.python-version }}-${{
+            github.run_attempt }}
+          path: ${{ env.PROJECT_ROOT }}/artifacts/coverage
+          if-no-files-found: warn
+          retention-days: 7
+          overwrite: true
+
+      - name: Finalize check results
+        id: finalize-tests
+        if: always()
+        env:
+          PYTEST_OUTCOME: ${{ steps.pytest.outcome || 'skipped' }}
+          COVERAGE_MIN_OUTCOME: ${{ steps.coverage_min.outcome || 'skipped' }}
+          COVERAGE_ENABLED: ${{ inputs.coverage }}
+        run: |
+          set -euo pipefail
+          failures=()
+
+          # Debug: print all outcomes
+          echo "PYTEST_OUTCOME=${PYTEST_OUTCOME}"
+          echo "COVERAGE_MIN_OUTCOME=${COVERAGE_MIN_OUTCOME}"
+          echo "COVERAGE_ENABLED=${COVERAGE_ENABLED}"
+          echo "pytest_outcome=${PYTEST_OUTCOME}" >> "${GITHUB_OUTPUT}"
+          echo "coverage_min_outcome=${COVERAGE_MIN_OUTCOME}" >> "${GITHUB_OUTPUT}"
+
+          record_outcome() {
+            local label="$1"
+            local outcome="$2"
+            echo "Checking ${label}: ${outcome}"
+            if [ -z "${outcome}" ] || \
+              [ "${outcome}" = 'success' ] || \
+              [ "${outcome}" = 'skipped' ]; then
+              return 0
+            fi
+            if [ "${outcome}" = 'cancelled' ]; then
+              failures+=("${label} cancelled")
+              return 0
+            fi
+            failures+=("${label} ${outcome}")
+          }
+
+          record_outcome "pytest" "${PYTEST_OUTCOME}"
+          if [ "${{ inputs.coverage && inputs['coverage-min'] != '' }}" = 'true' ]; then
+            record_outcome "coverage minimum" "${COVERAGE_MIN_OUTCOME}"
+          fi
+
+          echo "Total failures: ${#failures[@]}"
+          if [ "${#failures[@]}" -gt 0 ]; then
+            printf 'CI checks failed: %s\n' "${failures[*]}" >&2
+            exit 1
+          fi
+          echo "All checks passed!"
+
+      - name: Resolve primary python version
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import sys
+
+          primary = (os.environ.get("PRIMARY_IN") or "").strip()
+          python_versions_raw = (os.environ.get("PYTHON_VERSIONS_IN") or "").strip()
+          python_version_fallback = (os.environ.get("PYTHON_VERSION_IN") or "").strip()
+
+          if not primary:
+            candidates: list[str] = []
+            if python_versions_raw and python_versions_raw != "[]":
+              if "[" in python_versions_raw:
+                try:
+                  parsed = json.loads(python_versions_raw)
+                except json.JSONDecodeError:
+                  parsed = []
+                if isinstance(parsed, list):
+                  candidates = [str(value) for value in parsed if str(value).strip()]
+              else:
+                candidates = [python_versions_raw]
+            if candidates:
+              primary = candidates[0]
+            elif python_version_fallback:
+              primary = python_version_fallback
+            else:
+              primary = "3.11"
+
+          output_path = os.environ.get("GITHUB_ENV")
+          if not output_path:
+            print("GITHUB_ENV is not set", file=sys.stderr)
+            sys.exit(1)
+
+          with open(output_path, "a", encoding="utf-8") as handle:
+            handle.write(f"PRIMARY_PYTHON_VERSION={primary}\n")
+          print(f"Resolved PRIMARY_PYTHON_VERSION={primary}")
+          PY
+        env:
+          PRIMARY_IN: ${{ inputs['primary-python-version'] || '' }}
+          PYTHON_VERSIONS_IN: ${{ inputs['python-versions'] || '' }}
+          PYTHON_VERSION_IN: ${{ inputs['python-version'] || '' }}
+
+      - name: Build CI metrics payload
+        if: >-
+          ${{
+          (
+          inputs['enable-metrics']
+          || inputs['enable-history']
+          || inputs['enable-classification']
+          )
+          && matrix.python-version == env.PRIMARY_PYTHON_VERSION
+          }}
+        run: |
+          python "${GITHUB_WORKSPACE}/scripts/ci_metrics.py"
+        env:
+          JUNIT_PATH: pytest-junit.xml
+          OUTPUT_PATH: ci-metrics.json
+          TOP_N: ${{ inputs['slow-test-top'] }}
+          MIN_SECONDS: ${{ inputs['slow-test-min-seconds'] }}
+
+      - name: Upload metrics artifact
+        if: >-
+          ${{
+          inputs['enable-metrics']
+          && matrix.python-version == env.PRIMARY_PYTHON_VERSION
+          }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs['artifact-prefix'] }}ci-metrics
+          path: ${{ env.PROJECT_ROOT }}/ci-metrics.json
+          if-no-files-found: warn
+          retention-days: 7
+          overwrite: true
+
+      - name: Append metrics history
+        if: >-
+          ${{
+          (
+          inputs['enable-history']
+          || inputs['enable-classification']
+          )
+          && matrix.python-version == env.PRIMARY_PYTHON_VERSION
+          }}
+        run: |
+          python "${GITHUB_WORKSPACE}/scripts/ci_history.py"
+        env:
+          JUNIT_PATH: pytest-junit.xml
+          METRICS_PATH: ci-metrics.json
+          HISTORY_PATH: ${{ inputs['history-artifact-name'] }}
+          ENABLE_CLASSIFICATION: ${{ inputs['enable-classification'] }}
+          CLASSIFICATION_OUT: classification.json
+
+      - name: Upload metrics history artifact
+        if: >-
+          ${{
+          inputs['enable-history']
+          && matrix.python-version == env.PRIMARY_PYTHON_VERSION
+          }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs['artifact-prefix'] }}metrics-history
+          path: ${{ env.PROJECT_ROOT }}/${{ inputs['history-artifact-name'] }}
+          if-no-files-found: warn
+          retention-days: 7
+          overwrite: true
+
+      - name: Upload classification artifact
+        if: >-
+          ${{
+          inputs['enable-classification']
+          && matrix.python-version == env.PRIMARY_PYTHON_VERSION
+          }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs['artifact-prefix'] }}classification
+          path: ${{ env.PROJECT_ROOT }}/classification.json
+          if-no-files-found: warn
+          retention-days: 7
+          overwrite: true
+
+      - name: Compute coverage delta
+        if: >-
+          ${{
+          inputs.coverage
+          && inputs['enable-coverage-delta']
+          && matrix.python-version == env.PRIMARY_PYTHON_VERSION
+          }}
+        run: |
+          python "${GITHUB_WORKSPACE}/scripts/ci_coverage_delta.py"
+        env:
+          COVERAGE_XML_PATH: coverage.xml
+          OUTPUT_PATH: coverage-delta.json
+          BASELINE_COVERAGE: ${{ inputs['baseline-coverage'] }}
+          ALERT_DROP: ${{ inputs['coverage-alert-drop'] }}
+          FAIL_ON_DROP: ${{ inputs['fail-on-coverage-drop'] }}
+
+      - name: Upload coverage delta artifact
+        if: >-
+          ${{
+          inputs.coverage
+          && inputs['enable-coverage-delta']
+          && matrix.python-version == env.PRIMARY_PYTHON_VERSION
+          }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs['artifact-prefix'] }}coverage-delta
+          path: ${{ env.PROJECT_ROOT }}/coverage-delta.json
+          if-no-files-found: warn
+          retention-days: 7
+          overwrite: true
+
+      - name: Generate coverage trend summary
+        if: >-
+          ${{
+          inputs.coverage
+          && inputs['enable-soft-gate']
+          && matrix.python-version == env.PRIMARY_PYTHON_VERSION
+          }}
+        run: |
+          # shellcheck disable=SC2086
+          MIN_ARG=""
+          if [ -n "${{ inputs['coverage-min'] }}" ]; then
+            MIN_ARG="--minimum ${{ inputs['coverage-min'] }}"
+          fi
+          # shellcheck disable=SC2086
+          python "${GITHUB_WORKSPACE}/tools/coverage_trend.py" \
+            --coverage-xml coverage.xml \
+            --coverage-json coverage.json \
+            --baseline "${GITHUB_WORKSPACE}/config/coverage-baseline.json" \
+            --summary-path coverage-summary.md \
+            --job-summary "$GITHUB_STEP_SUMMARY" \
+            --artifact-path coverage-trend.json \
+            --github-output coverage-trend.env \
+            --soft \
+            $MIN_ARG
+
+      - name: Annotate coverage trend record
+        if: >-
+          ${{
+          inputs.coverage
+          && inputs['enable-soft-gate']
+          && matrix.python-version == env.PRIMARY_PYTHON_VERSION
+          }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          record_path = Path("coverage-trend.json")
+          if not record_path.exists():
+            raise SystemExit(0)
+          data = json.loads(record_path.read_text(encoding="utf-8"))
+          data.setdefault("run_id", os.environ.get("GITHUB_RUN_ID"))
+          data.setdefault("run_number", os.environ.get("GITHUB_RUN_NUMBER"))
+          record_path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+          PY
+
+      - name: Append coverage trend history
+        if: >-
+          ${{
+          inputs.coverage
+          && inputs['enable-soft-gate']
+          && matrix.python-version == env.PRIMARY_PYTHON_VERSION
+          }}
+        run: |
+          python "${GITHUB_WORKSPACE}/scripts/coverage_history_append.py"
+        env:
+          HISTORY_PATH: coverage-trend-history.ndjson
+          RECORD_PATH: coverage-trend.json
+
+      - name: Upload coverage summary artifact
+        if: >-
+          ${{
+          inputs.coverage
+          && inputs['enable-soft-gate']
+          && matrix.python-version == env.PRIMARY_PYTHON_VERSION
+          }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs['artifact-prefix'] }}coverage-summary
+          path: ${{ env.PROJECT_ROOT }}/coverage-summary.md
+          if-no-files-found: warn
+          retention-days: 7
+          overwrite: true
+
+      - name: Upload coverage trend artifact
+        if: >-
+          ${{
+          inputs.coverage
+          && inputs['enable-soft-gate']
+          && matrix.python-version == env.PRIMARY_PYTHON_VERSION
+          }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs['artifact-prefix'] }}coverage-trend
+          path: ${{ env.PROJECT_ROOT }}/coverage-trend.json
+          if-no-files-found: warn
+          retention-days: 7
+          overwrite: true
+
+      - name: Upload coverage trend history artifact
+        if: >-
+          ${{
+          inputs.coverage
+          && inputs['enable-soft-gate']
+          && matrix.python-version == env.PRIMARY_PYTHON_VERSION
+          }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs['artifact-prefix'] }}coverage-trend-history
+          path: ${{ env.PROJECT_ROOT }}/coverage-trend-history.ndjson
+          if-no-files-found: warn
+          retention-days: 7
+          overwrite: true
+
+  logs_summary:
+    name: logs summary
+    needs:
+      - lint-format
+      - lint-ruff
+      - typecheck-mypy
+      - tests
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      # Mint GitHub App token early to use for API calls (avoids rate limits)
+      - name: Mint GitHub App Token
+        id: app_token
+        uses: actions/create-github-app-token@v2
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.WORKFLOWS_APP_ID || '0' }}
+          private-key: ${{ secrets.WORKFLOWS_APP_PRIVATE_KEY || 'dummy' }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Checkout Workflows repo for actions
+        uses: actions/checkout@v6
+        with:
+          repository: stranske/Workflows
+          path: .workflows-lib
+          token: ${{ steps.app_token.outputs.token || github.token }}
+          sparse-checkout: |
+            .github/actions/setup-api-client
+            .github/scripts/github-api-with-retry.js
+            .github/scripts/github-rate-limited-wrapper.js
+            .github/scripts/token_load_balancer.js
+          sparse-checkout-cone-mode: false
+
+      - name: Setup API client
+        uses: ./.workflows-lib/.github/actions/setup-api-client
+        with:
+          secrets: ${{ toJSON(secrets) }}
+          github_token: ${{ github.token }}
+
+      - name: Summarize check outcomes
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import os
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          checks = [
+              (
+                "Black",
+                "${{ needs['lint-format'].result || 'skipped' }}",
+                "${{ needs['lint-format'].outputs.format_outcome || 'skipped' }}",
+              ),
+              (
+                "Ruff",
+                "${{ needs['lint-ruff'].result || 'skipped' }}",
+                "${{ needs['lint-ruff'].outputs.lint_outcome || 'skipped' }}",
+              ),
+              (
+                "Mypy",
+                "${{ needs['typecheck-mypy'].result || 'skipped' }}",
+                "${{ needs['typecheck-mypy'].outputs.mypy_outcome || 'skipped' }}",
+              ),
+              (
+                "Pytest",
+                "${{ needs.tests.result || 'skipped' }}",
+                "${{ needs.tests.outputs.pytest_outcome || 'skipped' }}",
+              ),
+              (
+                "Coverage minimum",
+                "${{ needs.tests.result || 'skipped' }}",
+                "${{ needs.tests.outputs.coverage_min_outcome || 'skipped' }}",
+              ),
+          ]
+
+          def normalize(value: str | None) -> str:
+              return (value or "skipped").lower()
+
+          if not summary_path:
+              raise SystemExit(0)
+
+          lines = [
+              "## CI checks",
+              "",
+              "| Check | Job result | Tool outcome |",
+              "| --- | --- | --- |",
+          ]
+          for name, job_result, tool_outcome in checks:
+              lines.append(f"| {name} | {normalize(job_result)} | {normalize(tool_outcome)} |")
+
+          with open(summary_path, "a", encoding="utf-8") as handle:
+              handle.write("\n".join(lines) + "\n\n")
+          PY
+
+      - name: Summarize workflow jobs
+        uses: actions/github-script@v8
+        with:
+
+          github-token: ${{ steps.app_token.outputs.token || github.token }}
+          script: |
+            const fs = require('fs');
+            const retryHelperPath = './.github/scripts/github-api-with-retry.js';
+            const retryHelpers = fs.existsSync(retryHelperPath)
+              ? require(retryHelperPath)
+              : {
+                  withRetry: (fn) => fn(),
+                  paginateWithRetry: (githubInstance, method, params) =>
+                    githubInstance.paginate(method, params),
+                };
+            const { paginateWithRetry } = retryHelpers;
+            const { owner, repo } = context.repo;
+            const run_id = context.runId;
+            let jobs;
+            try {
+              jobs = await paginateWithRetry(
+                github, github.rest.actions.listJobsForWorkflowRun,
+                { owner, repo, run_id, per_page: 100 },
+              );
+            } catch (error) {
+              const status = error?.status || error?.response?.status;
+              const isRateLimit = status === 403 && /rate limit/i.test(error?.message ?? '');
+              const message = isRateLimit
+                ? (
+                    'Skipped job summary because the GitHub API rate limit was hit ' +
+                    'while listing workflow jobs.'
+                  )
+                : (
+                    `Skipped job summary because job listing failed: ` +
+                    `${error?.message ?? 'unknown error'}`
+                  );
+              core.warning(message);
+              await core.summary
+                .addHeading('Workflow job summary', 3)
+                .addRaw(`${message}\n\n`)
+                .write();
+              return;
+            }
+            const statusEmoji = (conclusion) => {
+              switch (conclusion) {
+                case 'success':
+                  return '✅';
+                case 'failure':
+                  return '❌';
+                case 'cancelled':
+                  return '⏹️';
+                case 'skipped':
+                  return '⏭️';
+                case 'timed_out':
+                  return '⏱️';
+                default:
+                  return '❔';
+              }
+            };
+            const duration = (job) => {
+              if (!job.started_at || !job.completed_at) {
+                return '—';
+              }
+              const start = new Date(job.started_at);
+              const end = new Date(job.completed_at);
+              const seconds = Math.max(0, Math.round((end - start) / 1000));
+              const minutes = Math.floor(seconds / 60);
+              const remaining = seconds % 60;
+              if (minutes === 0) {
+                return `${seconds}s`;
+              }
+              return `${minutes}m ${remaining.toString().padStart(2, '0')}s`;
+            };
+            const table = [['Job', 'Status', 'Duration', 'Logs']];
+            for (const job of jobs) {
+              const conclusion = job.conclusion || job.status || 'unknown';
+              const emoji = statusEmoji(job.conclusion);
+              const logLink = job.html_url ? `[logs](${job.html_url})` : '—';
+              table.push([
+                job.name,
+                `${emoji} ${conclusion}`,
+                duration(job),
+                logLink,
+              ]);
+            }
+            await core.summary
+              .addHeading('Workflow job summary', 3)
+              .addTable(table)
+              .write()

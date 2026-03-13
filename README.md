@@ -21,3 +21,4 @@ repository. It is intended to validate compatibility from an external consumer p
 
 The placeholder string `stranske/Workflows/.github/workflows/reusable-10-ci-python.yml@main` inside the template files is replaced with your provided
 workflow reference when rendering.
+# Test
