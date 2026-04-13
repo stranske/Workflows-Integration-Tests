@@ -70,7 +70,7 @@ jobs:
         run: echo "start_ts=$(date -u +%s)" >> "$GITHUB_OUTPUT"
       - name: Security gate - prompt injection guard
         id: security_gate
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -123,7 +123,7 @@ jobs:
 
       - name: Evaluate keepalive state
         id: evaluate
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         env:
           INPUT_PR_NUMBER: ${{ github.event.inputs.pr_number || '' }}
           INPUT_FORCE_RETRY: ${{ github.event.inputs.force_retry || 'false' }}
@@ -227,7 +227,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Update summary with running status
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -381,7 +381,7 @@ jobs:
 
       - name: Auto-reconcile task checkboxes
         if: needs.run-codex.outputs.changes-made == 'true'
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         env:
           LLM_COMPLETED_TASKS: ${{ needs.run-codex.outputs.llm-completed-tasks || '[]' }}
         with:
@@ -443,7 +443,7 @@ jobs:
             core.setOutput('commit_tasks_count', result.sources?.commit || 0);
 
       - name: Update summary comment
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         env:
           CODEX_SUMMARY: ${{ needs.run-codex.outputs.final-message-summary || '' }}
         with:

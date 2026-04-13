@@ -62,7 +62,7 @@ jobs:
     steps:
       - name: Resolve PR context
         id: resolve
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const pr = context.payload.issue;
@@ -109,7 +109,7 @@ jobs:
     steps:
       - name: Resolve PR from workflow_run
         id: resolve
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const run = context.payload.workflow_run;
