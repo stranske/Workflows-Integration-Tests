@@ -37,9 +37,9 @@ def test_resolve_mypy_pin_as_script() -> None:
         [sys.executable, "tools/resolve_mypy_pin.py"],
         capture_output=True,
         text=True,
-        env={"MATRIX_PYTHON_VERSION": "3.11"},
+        env={"MATRIX_PYTHON_VERSION": "3.12"},
         cwd=Path(__file__).parent.parent,
     )
 
     assert result.returncode == 0
-    assert "python-version=3.11" in result.stdout
+    assert "python-version=3.12" in result.stdout
