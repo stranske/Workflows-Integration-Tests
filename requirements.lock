@@ -46,7 +46,7 @@ pytokens==0.4.1
     # via black
 ruff==0.15.1
     # via workflows-integration (pyproject.toml)
-tomli==2.4.0 ; python_full_version <= '3.11'
+tomli==2.4.0 ; python_full_version < '3.12'
     # via coverage
 typing-extensions==4.15.0
     # via mypy
