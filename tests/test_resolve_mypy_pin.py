@@ -66,8 +66,8 @@ def test_main_falls_back_to_matrix_version(monkeypatch: pytest.MonkeyPatch, tmp_
     assert "python-version=3.13" in content
 
 
-def test_main_defaults_to_311(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Test script uses 3.11 as default when nothing is set."""
+def test_main_defaults_to_312(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Test script uses 3.12 as default when nothing is set."""
     # No pyproject.toml
     monkeypatch.delenv("MATRIX_PYTHON_VERSION", raising=False)
     monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
@@ -86,13 +86,13 @@ def test_main_defaults_to_311(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
     result = main()
 
     assert result == 0
-    assert "python-version=3.11" in captured_output.getvalue()
+    assert "python-version=3.12" in captured_output.getvalue()
 
 
 def test_main_without_github_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Test script works locally without GITHUB_OUTPUT."""
     monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
-    monkeypatch.setenv("MATRIX_PYTHON_VERSION", "3.11")
+    monkeypatch.setenv("MATRIX_PYTHON_VERSION", "3.12")
     monkeypatch.chdir(tmp_path)  # No pyproject.toml
 
     import importlib
@@ -108,4 +108,4 @@ def test_main_without_github_output(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     result = main()
 
     assert result == 0
-    assert "python-version=3.11" in captured_output.getvalue()
+    assert "python-version=3.12" in captured_output.getvalue()

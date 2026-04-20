@@ -38,7 +38,7 @@ This test suite provides comprehensive coverage for the integration test reposit
 - **Tests**:
   - GITHUB_OUTPUT file writing
   - Local execution (no GITHUB_OUTPUT)
-  - Default Python version (3.11)
+  - Default Python version (3.12)
   - Custom Python version handling
   - Command-line invocation
 
@@ -98,6 +98,6 @@ uses: stranske/Workflows/.github/workflows/reusable-10-ci-python.yml@v1
 ```
 
 The CI validates:
-- All tests pass across Python 3.11, 3.12, 3.13
+- All tests pass across Python 3.12 and 3.13
 - Code coverage meets standards
 - Scripts can be executed as expected
