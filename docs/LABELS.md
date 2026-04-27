@@ -112,6 +112,21 @@ This document describes all labels that trigger automated workflows or affect CI
 
 ---
 
+### `runner:<agent>`
+
+**Applies to:** Issues
+
+**Trigger:** When applied to an issue that also has `agents:auto-pilot`
+
+**Effect:**
+1. Overrides the agent that auto-pilot will use (`runner:claude`, `runner:codex`, etc.)
+2. Auto-pilot reads this label during capability/check-pr steps and adds the matching `agent:<name>` label when it dispatches the belt
+3. Does **not** trigger the issue intake workflow by itself, so manual `agent:<name>` behavior is unaffected
+
+**Workflow:** `agents-auto-pilot.yml`
+
+---
+
 ### `agent:needs-attention`
 
 **Applies to:** Issues and Pull Requests
@@ -231,6 +246,33 @@ These labels control the LangChain-powered issue formatting pipeline introduced 
 
 ---
 
+## Workflow Source Labels
+
+These labels let direct GitHub PRs and non-issue-origin PRs integrate with
+Workflows source classification without forcing a GitHub issue.
+
+| Label | Applies to | Effect |
+|-------|------------|--------|
+| `workflow:source-issue` | Pull Requests | PR source is a GitHub issue. |
+| `workflow:source-local-request` | Pull Requests | PR source is a local Codex/user request. |
+| `workflow:source-automation` | Pull Requests | PR source is an automation or workflow run. |
+| `workflow:source-sync` | Pull Requests | PR source is a sync or maintenance campaign. |
+| `workflow:source-dependabot` | Pull Requests | PR source is Dependabot or dependency automation. |
+| `workflow:source-review-followup` | Pull Requests | PR source is review feedback follow-up. |
+| `workflow:source-direct-pr` | Pull Requests | PR was started directly on GitHub without a source issue. |
+| `workflow:no-automation` | Pull Requests | Automation should not manage the PR unless checks fail. |
+| `workflow:source-needed` | Pull Requests | Source context is missing or ambiguous. |
+
+The Workflow Source table is validated as a three-column Markdown table so label
+rows do not introduce an extra empty column in GitHub rendering.
+
+Use these labels as a backup to the PR template's Workflow Source section. If a
+PR has no linked issue and no valid Workflow Source, the PR metadata automation
+posts one repair comment instead of repeatedly treating the PR as issue-delivery
+work.
+
+---
+
 ## Verifier Labels
 
 These labels trigger the post-merge verifier workflow on a merged PR.
@@ -294,7 +336,7 @@ These labels trigger the post-merge verifier workflow on a merged PR.
 
 **Use Case:** User-triggered creation of follow-up work from verification feedback. Replaces automatic issue creation which was too aggressive.
 
-**Workflow:** `agents-verify-to-issue.yml`
+**Workflow:** `agents-verify-to-issue-v2.yml`
 
 ---
 
@@ -365,7 +407,7 @@ These labels are used for categorization but do not trigger workflows.
 
 **Effect:** Indicates this issue was created as follow-up to another issue or PR.
 
-**Applied by:** `agents-verify-to-issue.yml` workflow
+**Applied by:** `agents-verify-to-issue-v2.yml` workflow
 
 ---
 
