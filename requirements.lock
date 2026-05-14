@@ -8,11 +8,11 @@ colorama==0.4.6 ; sys_platform == 'win32'
     # via
     #   click
     #   pytest
-coverage==7.13.5
+coverage==7.14.0
     # via pytest-cov
 iniconfig==2.3.0
     # via pytest
-librt==0.10.0 ; platform_python_implementation != 'PyPy'
+librt==0.11.0 ; platform_python_implementation != 'PyPy'
     # via mypy
 mypy==1.19.1
     # via workflows-integration (pyproject.toml)
