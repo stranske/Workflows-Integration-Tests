@@ -2,13 +2,13 @@
 #    uv pip compile --python-version 3.12 pyproject.toml --extra test --extra dev --universal --output-file requirements.lock
 black==26.1.0
     # via workflows-integration (pyproject.toml)
-click==8.3.3
+click==8.4.1
     # via black
 colorama==0.4.6 ; sys_platform == 'win32'
     # via
     #   click
     #   pytest
-coverage==7.14.0
+coverage==7.14.1
     # via pytest-cov
 iniconfig==2.3.0
     # via pytest
@@ -28,7 +28,7 @@ pathspec==1.1.1
     # via
     #   black
     #   mypy
-platformdirs==4.9.6
+platformdirs==4.10.0
     # via black
 pluggy==1.6.0
     # via
