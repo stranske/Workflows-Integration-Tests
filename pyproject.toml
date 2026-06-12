@@ -12,11 +12,12 @@ test = [
     "pytest-cov>=4.1",
 ]
 dev = [
-    "pytest==9.0.2",
-    "pytest-cov==7.0.0",
-    "mypy==1.19.1",
-    "black==26.1.0",
-    "ruff==0.15.1",
+    "pytest==9.0.3",
+    "pytest-cov==7.1.0",
+    "mypy==2.1.0",
+    "black==26.5.1",
+    "ruff==0.15.17",
+    "coverage==7.14.1",
 ]
 
 [build-system]
@@ -41,6 +42,7 @@ skip_covered = false
 [tool.pytest.ini_options]
 addopts = "-ra --strict-markers"
 testpaths = ["tests"]
+pythonpath = ["src", "."]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
