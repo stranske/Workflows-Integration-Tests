@@ -100,11 +100,11 @@ jobs:
 
       - name: Checkout repository
         if: steps.check_enabled.outputs.enabled == 'true'
-        uses: actions/checkout@v7
+        uses: actions/checkout@v6
 
       - name: Checkout Workflows scripts
         if: steps.check_enabled.outputs.enabled == 'true'
-        uses: actions/checkout@v7
+        uses: actions/checkout@v6
         with:
           repository: stranske/Workflows
           ref: main
