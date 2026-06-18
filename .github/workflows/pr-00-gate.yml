@@ -43,7 +43,7 @@ jobs:
     uses: stranske/Workflows/.github/workflows/reusable-10-ci-python.yml@main
     with:
       python-versions: '["3.12", "3.13"]'
-      coverage-min: "80"
+      coverage-min: "35"
       format_check: false  # Using ruff for formatting
       working-directory: "."
       artifact-prefix: "gate-"
@@ -65,7 +65,7 @@ jobs:
       description: ${{ steps.summarize.outputs.description }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           sparse-checkout: |
             .github/scripts

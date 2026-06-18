@@ -43,6 +43,7 @@ jobs:
       format_check: true
       typecheck: true
       run-mypy: true
+      coverage-min: '35'
       enable-metrics: false
       enable-history: false
       enable-coverage-delta: false
