@@ -90,11 +90,11 @@ jobs:
 
       - name: Checkout repository
         if: steps.check.outputs.should_run == 'true'
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Checkout Workflows repository for scripts
         if: steps.check.outputs.should_run == 'true'
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: stranske/Workflows
           path: workflows-scripts
