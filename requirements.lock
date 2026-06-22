@@ -10,7 +10,7 @@ colorama==0.4.6 ; sys_platform == 'win32'
     # via
     #   click
     #   pytest
-coverage==7.14.1
+coverage==7.14.2
     # via
     #   workflows-integration (pyproject.toml)
     #   pytest-cov
