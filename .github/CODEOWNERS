@@ -1,0 +1,2 @@
+# CODEOWNERS for protected agent workflow changes.
+/.github/workflows/agents-*.yml @stranske
