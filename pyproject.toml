@@ -17,7 +17,7 @@ dev = [
     "mypy==2.3.0",
     "black==26.5.1",
     "ruff==0.16.1",
-    "coverage==7.15.2",
+    "coverage==7.15.3",
 ]
 
 [build-system]
