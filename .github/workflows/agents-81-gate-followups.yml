@@ -100,7 +100,20 @@ jobs:
       - name: Setup API client
         uses: ./.github/actions/setup-api-client
         with:
-          secrets: ${{ toJSON(secrets) }}
+          service_bot_pat: ${{ secrets.SERVICE_BOT_PAT }}
+          actions_bot_pat: ${{ secrets.ACTIONS_BOT_PAT }}
+          owner_pr_pat: ${{ secrets.OWNER_PR_PAT }}
+          agents_automation_pat: ${{ secrets.AGENTS_AUTOMATION_PAT }}
+          workflows_app_id: ${{ secrets.WORKFLOWS_APP_ID }}
+          workflows_app_private_key: ${{ secrets.WORKFLOWS_APP_PRIVATE_KEY }}
+          keepalive_app_id: ${{ secrets.KEEPALIVE_APP_ID }}
+          keepalive_app_private_key: ${{ secrets.KEEPALIVE_APP_PRIVATE_KEY }}
+          gh_app_id: ${{ secrets.GH_APP_ID }}
+          gh_app_private_key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          app_1_id: ${{ secrets.APP_1_ID }}
+          app_1_private_key: ${{ secrets.APP_1_PRIVATE_KEY }}
+          app_2_id: ${{ secrets.APP_2_ID }}
+          app_2_private_key: ${{ secrets.APP_2_PRIVATE_KEY }}
           github_token: ${{ github.token }}
 
       - name: Compute state fingerprint
@@ -465,7 +478,20 @@ jobs:
       - name: Setup API client
         uses: ./.github/actions/setup-api-client
         with:
-          secrets: ${{ toJSON(secrets) }}
+          service_bot_pat: ${{ secrets.SERVICE_BOT_PAT }}
+          actions_bot_pat: ${{ secrets.ACTIONS_BOT_PAT }}
+          owner_pr_pat: ${{ secrets.OWNER_PR_PAT }}
+          agents_automation_pat: ${{ secrets.AGENTS_AUTOMATION_PAT }}
+          workflows_app_id: ${{ secrets.WORKFLOWS_APP_ID }}
+          workflows_app_private_key: ${{ secrets.WORKFLOWS_APP_PRIVATE_KEY }}
+          keepalive_app_id: ${{ secrets.KEEPALIVE_APP_ID }}
+          keepalive_app_private_key: ${{ secrets.KEEPALIVE_APP_PRIVATE_KEY }}
+          gh_app_id: ${{ secrets.GH_APP_ID }}
+          gh_app_private_key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          app_1_id: ${{ secrets.APP_1_ID }}
+          app_1_private_key: ${{ secrets.APP_1_PRIVATE_KEY }}
+          app_2_id: ${{ secrets.APP_2_ID }}
+          app_2_private_key: ${{ secrets.APP_2_PRIVATE_KEY }}
           github_token: ${{ github.token }}
 
       - name: Mint KEEPALIVE_APP running token
@@ -506,17 +532,79 @@ jobs:
           permission-issues: write
           permission-pull-requests: read
 
+      - name: Select trusted keepalive running writer
+        id: running_token_writer
+        env:
+          KEEPALIVE_APP_TOKEN: ${{ steps.running_keepalive_app_token.outputs.token || '' }}
+          WORKFLOWS_APP_TOKEN: ${{ steps.running_workflows_app_token.outputs.token || '' }}
+          ACTIONS_TOKEN: ${{ secrets.ACTIONS_BOT_PAT || '' }}
+          SERVICE_TOKEN: ${{ secrets.SERVICE_BOT_PAT || '' }}
+        run: |
+          set -euo pipefail
+          if [ -n "$KEEPALIVE_APP_TOKEN" ]; then
+            echo 'source=KEEPALIVE_APP_TOKEN' >>"$GITHUB_OUTPUT"
+          elif [ -n "$WORKFLOWS_APP_TOKEN" ]; then
+            echo 'source=WORKFLOWS_APP_TOKEN' >>"$GITHUB_OUTPUT"
+          elif [ -n "$ACTIONS_TOKEN" ]; then
+            echo 'source=ACTIONS_BOT_PAT' >>"$GITHUB_OUTPUT"
+          elif [ -n "$SERVICE_TOKEN" ]; then
+            echo 'source=SERVICE_BOT_PAT' >>"$GITHUB_OUTPUT"
+          else
+            echo 'source=none' >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Probe PAT keepalive running identity
+        if: >-
+          steps.running_token_writer.outputs.source == 'ACTIONS_BOT_PAT' ||
+          steps.running_token_writer.outputs.source == 'SERVICE_BOT_PAT'
+        id: running_pat_identity
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          github-token: >-
+            ${{
+              (steps.running_token_writer.outputs.source == 'ACTIONS_BOT_PAT' &&
+                secrets.ACTIONS_BOT_PAT) ||
+              secrets.SERVICE_BOT_PAT
+            }}
+          script: |
+            const { withRetry } = require('./.github/scripts/github-api-with-retry.js');
+            const { data } = await withRetry(() => github.rest.users.getAuthenticated());
+            const login = (data?.login || '').trim();
+            if (!login) {
+              core.setFailed('Unable to determine identity for the mark-running PAT.');
+              return;
+            }
+            core.setOutput('login', login);
+
+      - name: Enforce PAT keepalive running identity
+        if: >-
+          steps.running_token_writer.outputs.source == 'ACTIONS_BOT_PAT' ||
+          steps.running_token_writer.outputs.source == 'SERVICE_BOT_PAT'
+        env:
+          TOKEN_SOURCE: ${{ steps.running_token_writer.outputs.source }}
+          TOKEN_LOGIN: ${{ steps.running_pat_identity.outputs.login || '' }}
+        run: |
+          set -euo pipefail
+          case "$TOKEN_SOURCE:$TOKEN_LOGIN" in
+            'ACTIONS_BOT_PAT:stranske'|'SERVICE_BOT_PAT:stranske-automation-bot') ;;
+            *)
+              echo "::error::$TOKEN_SOURCE has unexpected identity '$TOKEN_LOGIN'."
+              exit 1 ;;
+          esac
+
       - name: Require trusted keepalive running writer
         env:
           KEEPALIVE_RUNNING_TOKEN: >-
             ${{
               steps.running_keepalive_app_token.outputs.token ||
               steps.running_workflows_app_token.outputs.token ||
+              secrets.ACTIONS_BOT_PAT ||
+              secrets.SERVICE_BOT_PAT ||
               ''
             }}
         run: |
           if [ -z "$KEEPALIVE_RUNNING_TOKEN" ]; then
-            echo "::error::A dedicated keepalive or Workflows App token is required to mark the agent running."
+            echo "::error::A keepalive/Workflows App token or an approved PAT is required to mark the agent running."
             exit 1
           fi
 
@@ -527,13 +615,19 @@ jobs:
             ${{
               steps.running_keepalive_app_token.outputs.token != '' &&
               'stranske-keepalive[bot]' ||
-              'agents-workflows-bot[bot]'
+              steps.running_workflows_app_token.outputs.token != '' &&
+              'agents-workflows-bot[bot]' ||
+              steps.running_token_writer.outputs.source == 'ACTIONS_BOT_PAT' &&
+              'stranske' ||
+              'stranske-automation-bot'
             }}
         with:
           github-token: >-
             ${{
               steps.running_keepalive_app_token.outputs.token ||
-              steps.running_workflows_app_token.outputs.token
+              steps.running_workflows_app_token.outputs.token ||
+              secrets.ACTIONS_BOT_PAT ||
+              secrets.SERVICE_BOT_PAT
             }}
           script: |
             const { markAgentRunning } = require('./.github/scripts/keepalive_loop.js');
@@ -692,7 +786,20 @@ jobs:
       - name: Setup API client
         uses: ./.github/actions/setup-api-client
         with:
-          secrets: ${{ toJSON(secrets) }}
+          service_bot_pat: ${{ secrets.SERVICE_BOT_PAT }}
+          actions_bot_pat: ${{ secrets.ACTIONS_BOT_PAT }}
+          owner_pr_pat: ${{ secrets.OWNER_PR_PAT }}
+          agents_automation_pat: ${{ secrets.AGENTS_AUTOMATION_PAT }}
+          workflows_app_id: ${{ secrets.WORKFLOWS_APP_ID }}
+          workflows_app_private_key: ${{ secrets.WORKFLOWS_APP_PRIVATE_KEY }}
+          keepalive_app_id: ${{ secrets.KEEPALIVE_APP_ID }}
+          keepalive_app_private_key: ${{ secrets.KEEPALIVE_APP_PRIVATE_KEY }}
+          gh_app_id: ${{ secrets.GH_APP_ID }}
+          gh_app_private_key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          app_1_id: ${{ secrets.APP_1_ID }}
+          app_1_private_key: ${{ secrets.APP_1_PRIVATE_KEY }}
+          app_2_id: ${{ secrets.APP_2_ID }}
+          app_2_private_key: ${{ secrets.APP_2_PRIVATE_KEY }}
           github_token: ${{ github.token }}
 
       - name: Emit keepalive metrics
@@ -1102,7 +1209,20 @@ jobs:
       - name: Setup API client
         uses: ./.github/actions/setup-api-client
         with:
-          secrets: ${{ toJSON(secrets) }}
+          service_bot_pat: ${{ secrets.SERVICE_BOT_PAT }}
+          actions_bot_pat: ${{ secrets.ACTIONS_BOT_PAT }}
+          owner_pr_pat: ${{ secrets.OWNER_PR_PAT }}
+          agents_automation_pat: ${{ secrets.AGENTS_AUTOMATION_PAT }}
+          workflows_app_id: ${{ secrets.WORKFLOWS_APP_ID }}
+          workflows_app_private_key: ${{ secrets.WORKFLOWS_APP_PRIVATE_KEY }}
+          keepalive_app_id: ${{ secrets.KEEPALIVE_APP_ID }}
+          keepalive_app_private_key: ${{ secrets.KEEPALIVE_APP_PRIVATE_KEY }}
+          gh_app_id: ${{ secrets.GH_APP_ID }}
+          gh_app_private_key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          app_1_id: ${{ secrets.APP_1_ID }}
+          app_1_private_key: ${{ secrets.APP_1_PRIVATE_KEY }}
+          app_2_id: ${{ secrets.APP_2_ID }}
+          app_2_private_key: ${{ secrets.APP_2_PRIVATE_KEY }}
           github_token: ${{ github.token }}
 
       - name: Security gate - prompt injection guard
