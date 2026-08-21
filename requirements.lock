@@ -38,7 +38,7 @@ pluggy==1.6.0
     # via
     #   pytest
     #   pytest-cov
-pygments==2.20.0
+pygments==2.21.0
     # via pytest
 pytest==9.1.1
     # via
@@ -48,7 +48,7 @@ pytest-cov==7.1.0
     # via workflows-integration (pyproject.toml)
 pytokens==0.4.1
     # via black
-ruff==0.16.3
+ruff==0.16.4
     # via workflows-integration (pyproject.toml)
 typing-extensions==4.16.0
     # via mypy
