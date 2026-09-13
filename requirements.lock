@@ -46,7 +46,7 @@ pytest-cov==7.1.0
     # via workflows-integration (pyproject.toml)
 pytokens==0.4.1
     # via black
-ruff==0.16.6
+ruff==0.16.7
     # via workflows-integration (pyproject.toml)
 typing-extensions==4.16.0
     # via mypy
