@@ -2,13 +2,13 @@
 #    uv pip compile --python-version 3.12 pyproject.toml --extra test --extra dev --universal --output-file requirements.lock
 ast-serialize==0.12.1
     # via mypy
-black==26.5.1
+black==26.10.0
     # via workflows-integration (pyproject.toml)
 click==8.5.0
     # via black
 colorama==0.4.6 ; sys_platform == 'win32'
     # via pytest
-coverage==7.16.1
+coverage==7.16.2
     # via
     #   workflows-integration (pyproject.toml)
     #   pytest-cov
@@ -16,7 +16,7 @@ iniconfig==2.3.0
     # via pytest
 librt==0.16.0 ; platform_python_implementation != 'PyPy'
     # via mypy
-mypy==2.3.1
+mypy==2.4.0
     # via workflows-integration (pyproject.toml)
 mypy-extensions==1.1.0
     # via
@@ -30,7 +30,7 @@ pathspec==1.1.1
     # via
     #   black
     #   mypy
-platformdirs==4.12.2
+platformdirs==4.12.3
     # via black
 pluggy==1.6.0
     # via
@@ -46,7 +46,7 @@ pytest-cov==7.1.0
     # via workflows-integration (pyproject.toml)
 pytokens==0.4.1
     # via black
-ruff==0.16.9
+ruff==0.16.10
     # via workflows-integration (pyproject.toml)
 typing-extensions==4.16.0
     # via mypy
