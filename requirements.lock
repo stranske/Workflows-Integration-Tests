@@ -12,7 +12,7 @@ coverage==7.16.2
     # via
     #   workflows-integration (pyproject.toml)
     #   pytest-cov
-iniconfig==2.3.0
+iniconfig==2.3.1
     # via pytest
 librt==0.16.0 ; platform_python_implementation != 'PyPy'
     # via mypy
@@ -30,7 +30,7 @@ pathspec==1.1.1
     # via
     #   black
     #   mypy
-platformdirs==4.12.3
+platformdirs==4.13.0
     # via black
 pluggy==1.6.0
     # via
