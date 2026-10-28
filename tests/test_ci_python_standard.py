@@ -63,12 +63,12 @@ def test_scan_detects_a_retired_pin() -> None:
 
 
 def test_scan_detects_a_block_list_matrix() -> None:
-    text = "strategy:\n  python-version:\n    - \"3.13\"\n    - \"3.12\"\n  os: x\n"
+    text = 'strategy:\n  python-version:\n    - "3.13"\n    - "3.12"\n  os: x\n'
     assert _offenders(text) == ["2: python-version:"]
 
 
 def test_scan_ignores_comments_and_current_pins() -> None:
     assert _offenders('# python-version: "3.12"\n') == []
     assert _offenders('python-version: "3.14"  # was 3.12\n') == []
-    assert _offenders("python-versions: '[\"3.13\", \"3.14\"]'\n") == []
-    assert _offenders("python-version:\n  - \"3.14\"\nnext: 3.12\n") == []
+    assert _offenders('python-versions: \'["3.13", "3.14"]\'\n') == []
+    assert _offenders('python-version:\n  - "3.14"\nnext: 3.12\n') == []
