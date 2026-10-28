@@ -98,6 +98,6 @@ uses: stranske/Workflows/.github/workflows/reusable-10-ci-python.yml@v1
 ```
 
 The CI validates:
-- All tests pass across Python 3.12 and 3.13
+- All tests pass across Python 3.13 and 3.14
 - Code coverage meets standards
 - Scripts can be executed as expected
