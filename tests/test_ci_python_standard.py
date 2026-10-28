@@ -28,6 +28,6 @@ def test_workflow_python_pins_follow_standard(workflow: Path) -> None:
 
 
 def test_scan_detects_a_retired_pin() -> None:
-    assert _offenders('python-version: "3.12"\n') == ["1: python-version: \"3.12\""]
+    assert _offenders('python-version: "3.12"\n') == ['1: python-version: "3.12"']
     assert _offenders("name: Basic (3.12 only)\n")
     assert _offenders('python-versions: \'["3.13", "3.14"]\'\n') == []
