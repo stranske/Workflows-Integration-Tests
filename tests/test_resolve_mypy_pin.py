@@ -66,8 +66,8 @@ def test_main_falls_back_to_matrix_version(monkeypatch: pytest.MonkeyPatch, tmp_
     assert "python-version=3.13" in content
 
 
-def test_main_defaults_to_312(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Test script uses 3.12 as default when nothing is set."""
+def test_main_defaults_to_314(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Test script uses 3.14 (the primary runtime) as default when nothing is set."""
     # No pyproject.toml
     monkeypatch.delenv("MATRIX_PYTHON_VERSION", raising=False)
     monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
@@ -86,7 +86,7 @@ def test_main_defaults_to_312(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
     result = main()
 
     assert result == 0
-    assert "python-version=3.12" in captured_output.getvalue()
+    assert "python-version=3.14" in captured_output.getvalue()
 
 
 def test_main_without_github_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
