@@ -16,7 +16,7 @@ iniconfig==2.3.1
     # via pytest
 librt==0.16.0 ; platform_python_implementation != 'PyPy'
     # via mypy
-mypy==2.4.0
+mypy==2.4.1
     # via workflows-integration (pyproject.toml)
 mypy-extensions==1.1.0
     # via
@@ -30,7 +30,7 @@ pathspec==1.1.1
     # via
     #   black
     #   mypy
-platformdirs==4.13.6
+platformdirs==4.14.0
     # via black
 pluggy==1.7.0
     # via
@@ -38,7 +38,7 @@ pluggy==1.7.0
     #   pytest-cov
 pygments==2.21.0
     # via pytest
-pytest==9.1.1
+pytest==9.2.0
     # via
     #   workflows-integration (pyproject.toml)
     #   pytest-cov
