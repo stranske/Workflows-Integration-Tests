@@ -1,6 +1,7 @@
 'use strict';
 
 const { classifyError, ERROR_CATEGORIES } = require('./error_classifier');
+const { ensureRateLimitWrapped } = require('./github-rate-limited-wrapper.js');
 
 const DEFAULT_WORKFLOWS = [
   { workflow_name: 'Gate', workflow_id: 'pr-00-gate.yml' },
@@ -10,6 +11,7 @@ const DEFAULT_WORKFLOWS = [
 
 const DEFAULT_BASE_DELAY_MS = 1000;
 const DEFAULT_MAX_RETRIES = 3;
+const DEFAULT_JOB_SAMPLE_LIMIT = 5;
 
 function normalizeConclusion(run) {
   if (!run) {
@@ -106,6 +108,7 @@ async function fetchWorkflowRun({
   headShas,
   core,
   retryOptions,
+  requireExactBinding = false,
 }) {
   const candidates = Array.isArray(headShas)
     ? headShas.map((sha) => String(sha || '').trim()).filter(Boolean)
@@ -144,6 +147,9 @@ async function fetchWorkflowRun({
         continue;
       }
       const exact = runs.find((run) => run.head_sha === sha);
+      if (!exact && requireExactBinding) {
+        return { run: null, error: { category: 'provenance', message: 'CI run response does not match the requested delivery revision' } };
+      }
       return { run: exact || runs[0], error: null };
     }
     return { run: null, error: null };
@@ -151,13 +157,73 @@ async function fetchWorkflowRun({
     const category = getErrorCategory(error);
     // 404 errors are expected for workflows that don't exist in consumer repos
     // Use info level instead of warning to reduce noise
-    const isNotFound = category === ERROR_CATEGORIES.RESOURCE || error.status === 404;
+    const isNotFound = category === ERROR_CATEGORIES.resource || error.status === 404;
     const logFn = isNotFound ? core?.info?.bind(core) : core?.warning?.bind(core);
     logFn?.(
       `Failed to fetch workflow runs for ${workflowId}: ${error.message}; category=${category}`
     );
     return { run: null, error: { category, message: error.message } };
   }
+}
+
+async function fetchWorkflowJobs({
+  github,
+  owner,
+  repo,
+  runId,
+  core,
+  retryOptions,
+}) {
+  if (!runId) {
+    return { jobs: [], error: null };
+  }
+
+  try {
+    const response = await withRetry(
+      () =>
+        github.rest.actions.listJobsForWorkflowRun({
+          owner,
+          repo,
+          run_id: runId,
+          per_page: 100,
+        }),
+      { label: `listJobsForWorkflowRun:${runId}`, core, ...retryOptions }
+    );
+    const jobs = response?.data?.jobs || [];
+    return { jobs, error: null };
+  } catch (error) {
+    const category = getErrorCategory(error);
+    const isNotFound = category === ERROR_CATEGORIES.resource || error.status === 404;
+    const logFn = isNotFound ? core?.info?.bind(core) : core?.warning?.bind(core);
+    logFn?.(`Failed to fetch workflow jobs for ${runId}: ${error.message}; category=${category}`);
+    return { jobs: [], error: { category, message: error.message } };
+  }
+}
+
+function summarizeJobs(jobs, limit = DEFAULT_JOB_SAMPLE_LIMIT) {
+  const summary = {
+    total: jobs.length,
+    conclusions: {},
+    samples: [],
+    truncated: false,
+  };
+
+  if (!jobs.length) {
+    return summary;
+  }
+
+  for (const job of jobs) {
+    const conclusion = job.conclusion || job.status || 'unknown';
+    summary.conclusions[conclusion] = (summary.conclusions[conclusion] || 0) + 1;
+  }
+
+  const samples = jobs.slice(0, Math.max(0, limit)).map((job) => ({
+    name: job.name || 'job',
+    conclusion: job.conclusion || job.status || 'unknown',
+  }));
+  summary.samples = samples;
+  summary.truncated = jobs.length > samples.length;
+  return summary;
 }
 
 async function queryVerifierCiResults({
@@ -168,6 +234,8 @@ async function queryVerifierCiResults({
   targetShas,
   workflows,
   retryOptions,
+  includeHeadSha = false,
+  includeBinding = false,
 } = {}) {
   const { owner, repo } = context.repo;
   const candidates = [];
@@ -197,14 +265,35 @@ async function queryVerifierCiResults({
       headShas: candidates,
       core,
       retryOptions,
+      requireExactBinding: includeBinding,
     });
+    const { jobs, error: jobsError } = await fetchWorkflowJobs({
+      github,
+      owner,
+      repo,
+      runId: run?.id,
+      core,
+      retryOptions,
+    });
+    const jobsSummary = summarizeJobs(jobs);
     const conclusion = error ? 'api_error' : normalizeConclusion(run);
     results.push({
       workflow_name: workflowName,
+      ...(includeHeadSha || includeBinding ? { head_sha: run?.head_sha || '' } : {}),
+      ...(includeBinding ? { workflow_id: String(workflowId || ''),
+        run_id: Number.isSafeInteger(run?.id) && run.id > 0 ? run.id : null,
+        run_attempt: Number.isSafeInteger(run?.run_attempt) && run.run_attempt > 0 ? run.run_attempt : null,
+        binding_status: !run ? error ? 'unavailable' : 'absent'
+          : Number.isSafeInteger(run.id) && run.id > 0 && Number.isSafeInteger(run.run_attempt)
+            && run.run_attempt > 0 && candidates.includes(run.head_sha) ? 'bound' : 'unavailable',
+      } : {}),
       conclusion,
       run_url: run?.html_url || run?.url || '',
       error_category: error?.category || '',
       error_message: error?.message || '',
+      jobs_summary: jobsSummary,
+      jobs_error_category: jobsError?.category || '',
+      jobs_error_message: jobsError?.message || '',
     });
   }
 
@@ -213,5 +302,8 @@ async function queryVerifierCiResults({
 
 module.exports = {
   DEFAULT_WORKFLOWS,
-  queryVerifierCiResults,
+  queryVerifierCiResults: async function ({ github: rawGithub, context, core, targetSha, targetShas, workflows, retryOptions, includeHeadSha, includeBinding } = {}) {
+    const github = await ensureRateLimitWrapped({ github: rawGithub, core, env: process.env });
+    return queryVerifierCiResults({ github, context, core, targetSha, targetShas, workflows, retryOptions, includeHeadSha, includeBinding });
+  },
 };

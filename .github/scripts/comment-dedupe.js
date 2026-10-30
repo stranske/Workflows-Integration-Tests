@@ -1,21 +1,11 @@
 'use strict';
 
 const fs = require('fs');
+const { ensureRateLimitWrapped } = require('./github-rate-limited-wrapper.js');
+const { isRateLimitError } = require('./error_classifier');
 
 function trim(value) {
   return typeof value === 'string' ? value.trim() : '';
-}
-
-function isRateLimitError(error) {
-  if (!error) {
-    return false;
-  }
-  const status = error.status || error?.response?.status;
-  if (status !== 403) {
-    return false;
-  }
-  const message = String(error.message || error?.response?.data?.message || '').toLowerCase();
-  return message.includes('rate limit') || message.includes('ratelimit');
 }
 
 function isPullRequestEvent(context) {
@@ -111,7 +101,16 @@ function warn(core, message) {
   }
 }
 
-async function ensureMarkerComment({ github, context, core, commentBody, marker, baseMessage }) {
+async function ensureMarkerComment({ github: rawGithub, context, core, commentBody, marker, baseMessage }) {
+  // Wrap github client with rate-limit-aware retry
+  let github;
+  try {
+    github = await ensureRateLimitWrapped({ github: rawGithub, core, env: process.env });
+  } catch (error) {
+    warn(core, `Failed to wrap GitHub client: ${error.message} - using raw client`);
+    github = rawGithub;
+  }
+
   if (!isPullRequestEvent(context)) {
     info(core, 'Not a pull_request event; skipping comment management.');
     return;
@@ -197,7 +196,16 @@ async function ensureMarkerComment({ github, context, core, commentBody, marker,
   }
 }
 
-async function removeMarkerComments({ github, context, core, marker, baseMessages = [] }) {
+async function removeMarkerComments({ github: rawGithub, context, core, marker, baseMessages = [] }) {
+  // Wrap github client with rate-limit-aware retry
+  let github;
+  try {
+    github = await ensureRateLimitWrapped({ github: rawGithub, core, env: process.env });
+  } catch (error) {
+    warn(core, `Failed to wrap GitHub client: ${error.message} - using raw client`);
+    github = rawGithub;
+  }
+
   if (!isPullRequestEvent(context)) {
     info(core, 'Not a pull_request event; nothing to clean up.');
     return;
@@ -311,7 +319,7 @@ function findAnchoredComment(comments, { anchorPattern, fallbackMarker, targetAn
 }
 
 async function upsertAnchoredComment({
-  github,
+  github: rawGithub,
   context,
   core,
   prNumber,
@@ -320,6 +328,15 @@ async function upsertAnchoredComment({
   anchorPattern = /<!--\s*maint-46-post-ci:([^>]*)-->/i,
   fallbackMarker = '<!-- maint-46-post-ci:',
 }) {
+  // Wrap github client with rate-limit-aware retry
+  let github;
+  try {
+    github = await ensureRateLimitWrapped({ github: rawGithub, core, env: process.env });
+  } catch (error) {
+    warn(core, `Failed to wrap GitHub client: ${error.message} - using raw client`);
+    github = rawGithub;
+  }
+
   let commentBody = body;
   if (!commentBody && commentPath) {
     try {

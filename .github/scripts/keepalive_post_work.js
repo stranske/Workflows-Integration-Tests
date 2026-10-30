@@ -2,9 +2,16 @@
 
 const { setTimeout: sleep } = require('timers/promises');
 const { createKeepaliveStateManager } = require('./keepalive_state.js');
+const { ensureRateLimitWrapped } = require('./github-rate-limited-wrapper.js');
 
 const AGENT_LABEL_PREFIX = 'agent:';
-const MERGE_METHODS = new Set(['merge', 'squash', 'rebase']);
+// Resolve default agent from registry (used for agent alias + dispatch defaults)
+let _defaultAgent = 'codex';
+try {
+  const { loadAgentRegistry } = require('./agent_registry.js');
+  const _reg = loadAgentRegistry();
+  _defaultAgent = _reg.default_agent || 'codex';
+} catch (_) { /* registry not available */ }
 
 
 function normalise(value) {
@@ -36,46 +43,6 @@ function parseBoolean(value, fallback = false) {
     return false;
   }
   return fallback;
-}
-
-function parseCommaList(value) {
-  if (!value) {
-    return [];
-  }
-  if (Array.isArray(value)) {
-    return value
-      .map((entry) => normaliseLower(typeof entry === 'string' ? entry : entry?.login || entry?.name))
-      .filter(Boolean);
-  }
-  if (typeof value !== 'string') {
-    return [];
-  }
-  return value
-    .split(/[\s,]+/)
-    .map((entry) => normaliseLower(entry))
-    .filter(Boolean);
-}
-
-function clampMergeMethod(method, fallback = 'squash') {
-  const candidate = normaliseLower(method);
-  if (MERGE_METHODS.has(candidate)) {
-    return candidate;
-  }
-  if (candidate === 'ff' || candidate === 'fast-forward' || candidate === 'fastforward') {
-    return 'merge';
-  }
-  return fallback;
-}
-
-function toTimestamp(value) {
-  if (!value) {
-    return 0;
-  }
-  const parsed = Date.parse(value);
-  if (!Number.isFinite(parsed)) {
-    return 0;
-  }
-  return parsed;
 }
 
 async function delay(ms) {
@@ -155,7 +122,7 @@ function extractAgentAliasFromLabels(labels, fallback) {
       }
     }
   }
-  return normalise(fallback) || 'codex';
+  return normalise(fallback) || _defaultAgent;
 }
 
 function parseAgentState(env = {}) {
@@ -206,12 +173,14 @@ function parseAgentState(env = {}) {
   return response;
 }
 
-async function pollForHeadChange({ fetchHead, initialSha, timeoutMs, intervalMs, label, core }) {
-  const start = Date.now();
+async function pollForHeadChange({ fetchHead, initialSha, timeoutMs, intervalMs, label, core, clock }) {
+  const now = typeof clock?.now === 'function' ? clock.now : Date.now;
+  const pollSleep = typeof clock?.sleep === 'function' ? clock.sleep : delay;
+  const start = now();
   let attempts = 0;
   let lastSha = initialSha;
 
-  while (Date.now() - start <= timeoutMs) {
+  while (now() - start <= timeoutMs) {
     attempts += 1;
     try {
       const { headSha } = await fetchHead();
@@ -219,21 +188,21 @@ async function pollForHeadChange({ fetchHead, initialSha, timeoutMs, intervalMs,
         lastSha = headSha;
       }
       if (headSha && headSha !== initialSha) {
-        return { changed: true, headSha, attempts, elapsedMs: Date.now() - start };
+        return { changed: true, headSha, attempts, elapsedMs: now() - start };
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       core?.warning?.(`Failed to poll head during ${label || 'poll'}: ${message}`);
     }
 
-    if (Date.now() - start >= timeoutMs) {
+    if (now() - start >= timeoutMs) {
       break;
     }
 
-    await delay(intervalMs);
+    await pollSleep(intervalMs);
   }
 
-  return { changed: false, headSha: lastSha, attempts, elapsedMs: Date.now() - start };
+  return { changed: false, headSha: lastSha, attempts, elapsedMs: now() - start };
 }
 
 function buildSummaryRecorder(summary) {
@@ -360,7 +329,7 @@ async function dispatchCommand({
   const payload = {
     issue: Number.isFinite(prNumber) ? Number(prNumber) : parseNumber(prNumber, 0, { min: 0 }),
     action,
-    agent: agentAlias || 'codex',
+    agent: agentAlias || _defaultAgent,
     base: baseRef || '',
     head: headRef || '',
     head_sha: headSha || '',
@@ -403,10 +372,15 @@ async function dispatchFallbackWorkflow({
   idempotencyKey,
   roundTag = 'round=?',
   record,
+  statusMode = 'active',
 }) {
   if (!baseRef || !headRef || !headSha) {
     record('Fallback dispatch', `skipped: base/head/head_sha missing. ${roundTag}`);
     return { dispatched: false };
+  }
+  if (statusMode === 'dry-run') {
+    record('Fallback dispatch', `skipped: dry-run mode. ${roundTag}`);
+    return { dispatched: false, dryRun: true };
   }
   try {
     const inputs = {
@@ -486,171 +460,6 @@ async function findFallbackRun({ github, owner, repo, createdAfter, existingRunI
   return null;
 }
 
-function buildAutomationLoginSet(value, fallback = []) {
-  const list = parseCommaList(value);
-  if (!list.length && Array.isArray(fallback) && fallback.length) {
-    return new Set(parseCommaList(fallback));
-  }
-  return new Set(list);
-}
-
-function containsTrace(text, trace) {
-  if (!text || !trace) {
-    return false;
-  }
-  const haystack = normaliseLower(text);
-  const needle = normaliseLower(trace);
-  if (!haystack || !needle) {
-    return false;
-  }
-  return haystack.includes(needle);
-}
-
-function scoreConnectorPr(pr, { trace, baseRef }) {
-  let score = 0;
-  if (!pr || typeof pr !== 'object') {
-    return score;
-  }
-  if (containsTrace(pr.title, trace)) {
-    score += 4;
-  }
-  if (containsTrace(pr.body, trace)) {
-    score += 3;
-  }
-  const headRef = normaliseLower(pr.head?.ref);
-  if (headRef && trace && headRef.includes(normaliseLower(trace))) {
-    score += 2;
-  }
-  if (headRef && baseRef && headRef.includes(normaliseLower(baseRef))) {
-    score += 1;
-  }
-  const createdAt = toTimestamp(pr.created_at || pr.updated_at || pr.closed_at);
-  if (Number.isFinite(createdAt) && createdAt > 0) {
-    score += 0.000001 * createdAt;
-  }
-  return score;
-}
-
-async function locateConnectorPullRequest({
-  github,
-  owner,
-  repo,
-  baseRef,
-  trace,
-  createdAfter,
-  allowedLogins,
-}) {
-  if (!github?.rest?.pulls?.list) {
-    return null;
-  }
-  try {
-    const response = await github.rest.pulls.list({
-      owner,
-      repo,
-      state: 'open',
-      base: baseRef,
-      sort: 'created',
-      direction: 'desc',
-      per_page: 50,
-    });
-    const pulls = Array.isArray(response?.data) ? response.data : [];
-    if (!pulls.length) {
-      return null;
-    }
-    const allowed = allowedLogins instanceof Set ? allowedLogins : new Set();
-    const threshold = createdAfter ? createdAfter - 30_000 : 0;
-    let candidate = null;
-    let candidateScore = Number.NEGATIVE_INFINITY;
-    for (const pr of pulls) {
-      const created = toTimestamp(pr.created_at || pr.updated_at);
-      if (threshold && created && created < threshold) {
-        break;
-      }
-      const login = normaliseLower(pr.user?.login);
-      if (allowed.size && (!login || !allowed.has(login))) {
-        continue;
-      }
-      const score = scoreConnectorPr(pr, { trace, baseRef });
-      if (candidate === null || score > candidateScore) {
-        candidate = pr;
-        candidateScore = score;
-      }
-    }
-    return candidate;
-  } catch (error) {
-    return null;
-  }
-}
-
-async function mergeConnectorPullRequest({
-  github,
-  owner,
-  repo,
-  baseRef,
-  trace,
-  dispatchTimestamp,
-  allowedLogins,
-  mergeMethod,
-  deleteBranch,
-  record,
-  appendRound,
-}) {
-  const createdAfter = dispatchTimestamp ? toTimestamp(dispatchTimestamp) : 0;
-  const pr = await locateConnectorPullRequest({
-    github,
-    owner,
-    repo,
-    baseRef,
-    trace,
-    createdAfter,
-    allowedLogins,
-  });
-  if (!pr) {
-    record('Create-pr auto-merge', appendRound('no connector PR detected.'));
-    return { attempted: true, merged: false };
-  }
-
-  const prNumber = Number(pr.number);
-  const prUrl = normalise(pr?.html_url);
-  if (!Number.isFinite(prNumber) || prNumber <= 0) {
-    record('Create-pr auto-merge', appendRound('skipped: invalid PR identifier.'));
-    return { attempted: true, merged: false, prUrl };
-  }
-
-  try {
-    await github.rest.pulls.merge({
-      owner,
-      repo,
-      pull_number: prNumber,
-      merge_method: mergeMethod,
-      commit_title: `Keepalive sync ${trace || ''}`.trim(),
-    });
-    record('Create-pr auto-merge', appendRound(`merged PR #${prNumber} using ${mergeMethod}.`));
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    record('Create-pr auto-merge', appendRound(`failed: ${message}`));
-    return { attempted: true, merged: false, prNumber, error: message, prUrl };
-  }
-
-  let branchDeleted = false;
-  if (deleteBranch && pr.head?.ref && !pr.head?.repo?.fork) {
-    try {
-      await github.rest.git.deleteRef({
-        owner,
-        repo,
-        ref: `heads/${pr.head.ref}`,
-      });
-      branchDeleted = true;
-      record('Create-pr cleanup', appendRound(`deleted branch ${pr.head.ref}.`));
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      record('Create-pr cleanup', appendRound(`failed to delete branch ${pr.head.ref}: ${message}`));
-    }
-  }
-
-  return { attempted: true, merged: true, prNumber, branchDeleted, prUrl };
-}
-
 function formatCommandBody(action, trace, round) {
   const parts = [`/${normalise(action)}`.trim()];
   if (trace) {
@@ -721,6 +530,8 @@ async function attemptUpdateBranchViaApi({
   core,
   record,
   appendRound,
+  statusMode = 'active',
+  clock,
 }) {
   if (!Number.isFinite(prNumber) || prNumber <= 0 || !baselineHead) {
     record('Update-branch API', appendRound('skipped: missing PR context or baseline head.'));
@@ -729,6 +540,10 @@ async function attemptUpdateBranchViaApi({
   if (!github?.rest?.pulls?.updateBranch) {
     record('Update-branch API', appendRound('skipped: Octokit client lacks updateBranch support.'));
     return { attempted: false };
+  }
+  if (statusMode === 'dry-run') {
+    record('Update-branch API', appendRound('skipped: dry-run mode.'));
+    return { attempted: false, dryRun: true };
   }
 
   const requestPayload = {
@@ -763,6 +578,7 @@ async function attemptUpdateBranchViaApi({
       intervalMs: pollIntervalMs,
       label: 'update-branch-api',
       core,
+      clock,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -783,7 +599,23 @@ async function attemptUpdateBranchViaApi({
   };
 }
 
-async function runKeepalivePostWork({ core, github, context, env = process.env }) {
+async function runKeepalivePostWork({
+  core,
+  github: rawGithub,
+  context,
+  env = process.env,
+  clock = { now: Date.now, sleep: delay },
+}) {
+  // Wrap github client with rate-limit-aware retry
+  let github;
+  try {
+    github = await ensureRateLimitWrapped({ github: rawGithub, core, env });
+    core?.debug?.('GitHub client wrapped with rate-limit protection');
+  } catch (error) {
+    core?.warning?.(`Failed to wrap GitHub client: ${error.message} - using raw client`);
+    github = rawGithub;
+  }
+
   const summaryHelper = buildSummaryRecorder(core?.summary);
   const record = summaryHelper.record;
   const remediationNotes = [];
@@ -812,21 +644,20 @@ async function runKeepalivePostWork({ core, github, context, env = process.env }
   const commentUrlEnv = normalise(env.COMMENT_URL);
   const commentTraceEnv = normalise(env.COMMENT_TRACE);
   const commentRoundEnv = normalise(env.COMMENT_ROUND);
-  const agentAliasEnv = normalise(env.AGENT_ALIAS) || 'codex';
+  const agentAliasEnv = normalise(env.AGENT_ALIAS) || _defaultAgent;
   const syncLabel = normaliseLower(env.SYNC_LABEL) || 'agents:sync-required';
   const debugLabel = normaliseLower(env.DEBUG_LABEL) || 'agents:debug';
+  // API contract: `codex-pr-comment-command` event type is matched by dispatch handlers in consumers
   const dispatchEventType = normalise(env.DISPATCH_EVENT_TYPE) || 'codex-pr-comment-command';
   const ttlShort = parseNumber(env.TTL_SHORT_MS, 90_000, { min: 0 });
   const pollShort = parseNumber(env.POLL_SHORT_MS, 5_000, { min: 0 });
   const ttlLong = parseNumber(env.TTL_LONG_MS, 240_000, { min: 0 });
   const pollLong = parseNumber(env.POLL_LONG_MS, 5_000, { min: 0 });
-  const automationLogins = buildAutomationLoginSet(env.AUTOMATION_LOGINS);
-  const mergeMethod = clampMergeMethod(env.MERGE_METHOD, 'squash');
-  const deleteTempBranch = parseBoolean(env.DELETE_TEMP_BRANCH, true);
   const roundTag = `round=${round || '?'}`;
   const appendRound = (message) => `${message} ${roundTag}`;
 
   const statusMode = parseBoolean(env.DRY_RUN, false) ? 'dry-run' : 'active';
+  const isDryRun = statusMode === 'dry-run';
   let syncStatus = 'needs_update';
   let statusHead = baselineHead || '';
   let statusBase = baseBranch || '';
@@ -1026,6 +857,13 @@ async function runKeepalivePostWork({ core, github, context, env = process.env }
   let stateCommentUrl = stateManager.commentUrl || '';
 
   const applyStateUpdate = async (updates, { forcePersist = false } = {}) => {
+    if (isDryRun) {
+      state = mergeStateShallow(state, updates);
+      commandState = state.command_dispatch && typeof state.command_dispatch === 'object' ? state.command_dispatch : {};
+      escalationRecord = state.escalation_comment && typeof state.escalation_comment === 'object' ? state.escalation_comment : {};
+      return { state: { ...state }, commentId: stateCommentId, commentUrl: stateCommentUrl, dryRun: true };
+    }
+
     if (!forcePersist && !stateCommentId) {
       state = mergeStateShallow(state, updates);
       commandState = state.command_dispatch && typeof state.command_dispatch === 'object' ? state.command_dispatch : {};
@@ -1046,7 +884,7 @@ async function runKeepalivePostWork({ core, github, context, env = process.env }
     const saved = await applyStateUpdate({}, { forcePersist: true });
     stateCommentId = saved.commentId || stateCommentId;
     stateCommentUrl = saved.commentUrl || stateCommentUrl;
-    record('State comment', appendRound(`initialised id=${stateCommentId || 0}`));
+    record('State comment', appendRound(isDryRun ? 'skipped initialisation: dry-run mode.' : `initialised id=${stateCommentId || 0}`));
   } else {
     record('State comment', appendRound(`reused id=${stateCommentId}`));
   }
@@ -1239,12 +1077,16 @@ async function runKeepalivePostWork({ core, github, context, env = process.env }
   if (baselineHead && initialHead && baselineHead !== initialHead) {
     record('Head check', `Head already advanced to ${initialHead}; skipping sync gate.`);
     if (hasSyncLabel) {
-      try {
-        await github.rest.issues.removeLabel({ owner, repo, issue_number: prNumber, name: syncLabel });
-        record('Sync label', appendRound(`Removed ${syncLabel}.`));
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        record('Sync label', appendRound(`Failed to remove ${syncLabel}: ${message}`));
+      if (isDryRun) {
+        record('Sync label', appendRound(`Skipped removing ${syncLabel}: dry-run mode.`));
+      } else {
+        try {
+          await github.rest.issues.removeLabel({ owner, repo, issue_number: prNumber, name: syncLabel });
+          record('Sync label', appendRound(`Removed ${syncLabel}.`));
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          record('Sync label', appendRound(`Failed to remove ${syncLabel}: ${message}`));
+        }
       }
     } else {
       record('Sync label', appendRound(`${syncLabel} not present.`));
@@ -1371,6 +1213,10 @@ async function runKeepalivePostWork({ core, github, context, env = process.env }
       record('Update-branch API', appendRound('skipped: baseline head missing.'));
       return { changed: false };
     }
+    if (isDryRun) {
+      record('Update-branch API', appendRound('skipped: dry-run mode.'));
+      return { changed: false, dryRun: true };
+    }
 
     try {
       const response = await github.rest.pulls.updateBranch({
@@ -1393,6 +1239,7 @@ async function runKeepalivePostWork({ core, github, context, env = process.env }
       intervalMs: pollLong,
       label: 'api-update-branch',
       core,
+      clock,
     });
 
     if (pollResult?.changed) {
@@ -1432,6 +1279,7 @@ async function runKeepalivePostWork({ core, github, context, env = process.env }
           headRepo: headRepoFullName,
           headIsFork,
           record,
+          statusMode,
         });
 
     if (!dispatchInfo.dispatched) {
@@ -1490,6 +1338,7 @@ async function runKeepalivePostWork({ core, github, context, env = process.env }
       intervalMs: pollLong,
       label: 'helper-sync',
       core,
+      clock,
     });
 
     if (pollResult?.changed) {
@@ -1522,6 +1371,7 @@ async function runKeepalivePostWork({ core, github, context, env = process.env }
     intervalMs: pollShort,
     label: 'comment-wait',
     core,
+    clock,
   });
   if (shortPoll.changed) {
     success = true;
@@ -1569,6 +1419,8 @@ async function runKeepalivePostWork({ core, github, context, env = process.env }
       core,
       record,
       appendRound,
+      statusMode,
+      clock,
     });
     if (apiResult?.attempted) {
       if (apiResult?.changed) {
@@ -1625,6 +1477,7 @@ async function runKeepalivePostWork({ core, github, context, env = process.env }
           headRepo: headRepoFullName,
           headIsFork,
           record,
+          statusMode,
         });
 
     if (dispatchInfo.dispatched && !state.fallback_dispatch?.dispatched) {
@@ -1703,15 +1556,19 @@ async function runKeepalivePostWork({ core, github, context, env = process.env }
     await persistLastInstruction(finalHead || baselineHead || initialHead);
 
     if (hasSyncLabel) {
-      try {
-        await github.rest.issues.removeLabel({ owner, repo, issue_number: prNumber, name: syncLabel });
-        record('Sync label', `Removed ${syncLabel}.`);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        record('Sync label', `Failed to remove ${syncLabel}: ${message}`);
+      if (isDryRun) {
+        record('Sync label', appendRound(`Skipped removing ${syncLabel}: dry-run mode.`));
+      } else {
+        try {
+          await github.rest.issues.removeLabel({ owner, repo, issue_number: prNumber, name: syncLabel });
+          record('Sync label', appendRound(`Removed ${syncLabel}.`));
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          record('Sync label', appendRound(`Failed to remove ${syncLabel}: ${message}`));
+        }
       }
     } else {
-      record('Sync label', `${syncLabel} not present.`);
+      record('Sync label', appendRound(`${syncLabel} not present.`));
     }
     const elapsed = Date.now() - startTime;
     record('Result', appendRound(`mode=${mode || 'unknown'} sha=${finalHead || '(unknown)'} elapsed=${elapsed}ms`));
@@ -1742,12 +1599,16 @@ async function runKeepalivePostWork({ core, github, context, env = process.env }
   });
 
   if (!hasSyncLabel) {
-    try {
-      await github.rest.issues.addLabels({ owner, repo, issue_number: prNumber, labels: [syncLabel] });
-      record('Sync label', appendRound(`Applied ${syncLabel}.`));
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      record('Sync label', appendRound(`Failed to apply ${syncLabel}: ${message}`));
+    if (isDryRun) {
+      record('Sync label', appendRound(`Skipped applying ${syncLabel}: dry-run mode.`));
+    } else {
+      try {
+        await github.rest.issues.addLabels({ owner, repo, issue_number: prNumber, labels: [syncLabel] });
+        record('Sync label', appendRound(`Applied ${syncLabel}.`));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        record('Sync label', appendRound(`Failed to apply ${syncLabel}: ${message}`));
+      }
     }
   } else {
     record('Sync label', appendRound(`${syncLabel} already present.`));
@@ -1776,25 +1637,29 @@ async function runKeepalivePostWork({ core, github, context, env = process.env }
     record('Escalation comment', appendRound('Reusing previous escalation comment.'));
   } else {
     const escalationMessage = `Keepalive: manual action needed — use update-branch/create-pr controls (click Update Branch or open Create PR) at: ${manualActionLink}`;
-    try {
-      const { data: escalationComment } = await github.rest.issues.createComment({
-        owner,
-        repo,
-        issue_number: prNumber,
-        body: escalationMessage,
-      });
-      updateSyncLink(escalationComment?.html_url || manualActionLink, { prefer: true });
-      await updateEscalationRecord({
-        comment_id: escalationComment?.id || '',
-        comment_url: escalationComment?.html_url || '',
-        idempotency_key: idempotencyKey,
-        recorded_at: new Date().toISOString(),
-        body: escalationMessage,
-      });
-      record('Escalation comment', appendRound('Posted escalation notice.'));
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      record('Escalation comment', appendRound(`Failed to post escalation comment: ${message}`));
+    if (isDryRun) {
+      record('Escalation comment', appendRound('Skipped posting escalation notice: dry-run mode.'));
+    } else {
+      try {
+        const { data: escalationComment } = await github.rest.issues.createComment({
+          owner,
+          repo,
+          issue_number: prNumber,
+          body: escalationMessage,
+        });
+        updateSyncLink(escalationComment?.html_url || manualActionLink, { prefer: true });
+        await updateEscalationRecord({
+          comment_id: escalationComment?.id || '',
+          comment_url: escalationComment?.html_url || '',
+          idempotency_key: idempotencyKey,
+          recorded_at: new Date().toISOString(),
+          body: escalationMessage,
+        });
+        record('Escalation comment', appendRound('Posted escalation notice.'));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        record('Escalation comment', appendRound(`Failed to post escalation comment: ${message}`));
+      }
     }
   }
 

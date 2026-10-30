@@ -2,12 +2,22 @@
 
 const { makeTrace } = require('./keepalive_contract.js');
 const { getKeepaliveInstructionWithMention } = require('./keepalive_instruction_template.js');
+const { ensureRateLimitWrapped } = require('./github-rate-limited-wrapper.js');
 
 const DEFAULT_READINESS_AGENTS = 'copilot,codex';
 const DEFAULT_VERIFY_ISSUE_ASSIGNEES =
   'copilot,chatgpt-codex-connector,stranske-automation-bot';
+
+// Resolve default agent from registry (falls back to 'codex')
+let _defaultAgentKey = 'codex';
+try {
+  const { loadAgentRegistry } = require('./agent_registry.js');
+  const registry = loadAgentRegistry();
+  _defaultAgentKey = registry.default_agent || 'codex';
+} catch (_) { /* registry not available — use codex default */ }
+
 // Instruction loaded from .github/templates/keepalive-instruction.md
-const DEFAULT_KEEPALIVE_INSTRUCTION = getKeepaliveInstructionWithMention('codex');
+const DEFAULT_KEEPALIVE_INSTRUCTION = getKeepaliveInstructionWithMention(_defaultAgentKey);
 const DEFAULT_OPTIONS_JSON = '{}';
 const KEEPALIVE_PAUSE_LABEL = 'keepalive:paused';
 
@@ -25,7 +35,7 @@ const DEFAULTS = {
   enable_watchdog: 'true',
   enable_keepalive: 'true',
   enable_bootstrap: 'false',
-  bootstrap_issues_label: 'agent:codex',
+  bootstrap_issues_label: `agent:${_defaultAgentKey}`,
   draft_pr: 'false',
   diagnostic_mode: 'off',
   options_json: DEFAULT_OPTIONS_JSON,
@@ -512,7 +522,7 @@ async function resolveOrchestratorParams({ github, context, core, env = process.
       merged.bootstrap_issues_label ?? bootstrap.label,
       DEFAULTS.bootstrap_issues_label
     ),
-    draft_pr: toBoolString(merged.draft_pr, DEFAULTS.draft_pr),
+    draft_pr: 'false',
     dry_run: dryRun,
     options_json: finalOptionsJson,
     dispatcher_force_issue: dispatcherForceIssue,
@@ -581,7 +591,10 @@ async function resolveOrchestratorParams({ github, context, core, env = process.
 }
 
 module.exports = {
-  resolveOrchestratorParams,
+  resolveOrchestratorParams: async function ({ github: rawGithub, context, core, env = process.env }) {
+    const github = await ensureRateLimitWrapped({ github: rawGithub, core, env });
+    return resolveOrchestratorParams({ github, context, core, env });
+  },
   __internals: {
     toString,
     toBoolString,

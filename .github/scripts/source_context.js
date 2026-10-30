@@ -1,0 +1,751 @@
+'use strict';
+
+const SOURCE_TYPES = Object.freeze({
+  GITHUB_ISSUE: 'github_issue',
+  LOCAL_REQUEST: 'local_request',
+  AUTOMATION_RUN: 'automation_run',
+  SYNC_CAMPAIGN: 'sync_campaign',
+  DEPENDABOT: 'dependabot',
+  REVIEW_FOLLOWUP: 'review_followup',
+  MANUAL_REMOTE: 'manual_remote',
+  UNKNOWN: 'unknown',
+});
+
+const VALID_SOURCE_TYPES = new Set(Object.values(SOURCE_TYPES).filter((type) => type !== SOURCE_TYPES.UNKNOWN));
+
+const SOURCE_LABELS = Object.freeze({
+  'workflow:source-issue': SOURCE_TYPES.GITHUB_ISSUE,
+  workflow_source_issue: SOURCE_TYPES.GITHUB_ISSUE,
+  'workflow:source-local-request': SOURCE_TYPES.LOCAL_REQUEST,
+  workflow_source_local_request: SOURCE_TYPES.LOCAL_REQUEST,
+  'workflow:source-automation': SOURCE_TYPES.AUTOMATION_RUN,
+  workflow_source_automation: SOURCE_TYPES.AUTOMATION_RUN,
+  'workflow:source-sync': SOURCE_TYPES.SYNC_CAMPAIGN,
+  workflow_source_sync: SOURCE_TYPES.SYNC_CAMPAIGN,
+  'workflow:source-maintenance': SOURCE_TYPES.SYNC_CAMPAIGN,
+  workflow_source_maintenance: SOURCE_TYPES.SYNC_CAMPAIGN,
+  'workflow:source-dependabot': SOURCE_TYPES.DEPENDABOT,
+  workflow_source_dependabot: SOURCE_TYPES.DEPENDABOT,
+  'workflow:source-review-followup': SOURCE_TYPES.REVIEW_FOLLOWUP,
+  workflow_source_review_followup: SOURCE_TYPES.REVIEW_FOLLOWUP,
+  'workflow:source-direct-pr': SOURCE_TYPES.MANUAL_REMOTE,
+  workflow_source_direct_pr: SOURCE_TYPES.MANUAL_REMOTE,
+  'workflow:no-automation': SOURCE_TYPES.MANUAL_REMOTE,
+  workflow_no_automation: SOURCE_TYPES.MANUAL_REMOTE,
+});
+
+const NO_AUTOMATION_LABELS = new Set(['workflow:no-automation', 'workflow_no_automation']);
+
+const CHECKBOX_SOURCE_PATTERNS = Object.freeze([
+  [SOURCE_TYPES.GITHUB_ISSUE, /\bgithub\s+issue\b|\bsource\s+issue\b/i],
+  [
+    SOURCE_TYPES.MANUAL_REMOTE,
+    /\bdirect\s+pr\b|\bremote\s+github\s+work\b|\bstarted\s+directly\b|\bdo\s+not\s+automate\b|\bhuman[- ]only\b/i,
+  ],
+  [SOURCE_TYPES.LOCAL_REQUEST, /\blocal\s+(?:codex(?:\s*\/\s*|\s+)?user|codex|user)\s+request\b|\blocal\s+request\b/i],
+  [SOURCE_TYPES.AUTOMATION_RUN, /\bautomation\s+run\b|\bworkflow\s+run\b/i],
+  [SOURCE_TYPES.REVIEW_FOLLOWUP, /\breview\s+follow[- ]?up\b|\bfollow[- ]?up\s+from\s+pr\b/i],
+  [SOURCE_TYPES.SYNC_CAMPAIGN, /\bsync\b|\bmaintenance\s+campaign\b|\bmaintenance\b/i],
+  [SOURCE_TYPES.DEPENDABOT, /\bdependabot\b|\bdependency\s+update\b/i],
+]);
+
+const NO_AUTOMATION_CHECKBOX_PATTERN = /\bdo\s+not\s+automate\b|\bhuman[- ]only\b/i;
+const DEPENDENCY_REPAIR_PROMOTION_PATTERN =
+  /<!--\s*dependency-repair-promotion:v1\s+(\{[^\n]*\})\s*-->/;
+const CONSUMER_SYNC_PATTERN =
+  /<!--\s*workflows-consumer-sync:v1\s+(\{[^\n]*\})\s*-->/;
+const VERIFIER_CORPUS_HARVEST_BRANCH = 'verifier-corpus-harvest/auto';
+const VERIFIER_CORPUS_HARVEST_REPOSITORY = 'stranske/Workflows';
+
+function cleanString(value) {
+  return String(value || '').trim();
+}
+
+function normalizeToken(value) {
+  return cleanString(value)
+    .toLowerCase()
+    .replace(/[`*~]/g, '')
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+}
+
+function normalizeSourceType(value) {
+  const token = normalizeToken(value);
+  if (!token) {
+    return SOURCE_TYPES.UNKNOWN;
+  }
+
+  const aliases = new Map([
+    ['issue', SOURCE_TYPES.GITHUB_ISSUE],
+    ['github_issue', SOURCE_TYPES.GITHUB_ISSUE],
+    ['source_issue', SOURCE_TYPES.GITHUB_ISSUE],
+    ['local', SOURCE_TYPES.LOCAL_REQUEST],
+    ['local_request', SOURCE_TYPES.LOCAL_REQUEST],
+    ['local_codex_request', SOURCE_TYPES.LOCAL_REQUEST],
+    ['local_user_request', SOURCE_TYPES.LOCAL_REQUEST],
+    ['automation', SOURCE_TYPES.AUTOMATION_RUN],
+    ['automation_run', SOURCE_TYPES.AUTOMATION_RUN],
+    ['workflow_run', SOURCE_TYPES.AUTOMATION_RUN],
+    ['sync', SOURCE_TYPES.SYNC_CAMPAIGN],
+    ['sync_campaign', SOURCE_TYPES.SYNC_CAMPAIGN],
+    ['maintenance', SOURCE_TYPES.SYNC_CAMPAIGN],
+    ['maintenance_sync', SOURCE_TYPES.SYNC_CAMPAIGN],
+    ['dependabot', SOURCE_TYPES.DEPENDABOT],
+    ['dependency_update', SOURCE_TYPES.DEPENDABOT],
+    ['review_followup', SOURCE_TYPES.REVIEW_FOLLOWUP],
+    ['review_follow_up', SOURCE_TYPES.REVIEW_FOLLOWUP],
+    ['followup', SOURCE_TYPES.REVIEW_FOLLOWUP],
+    ['follow_up', SOURCE_TYPES.REVIEW_FOLLOWUP],
+    ['manual', SOURCE_TYPES.MANUAL_REMOTE],
+    ['manual_remote', SOURCE_TYPES.MANUAL_REMOTE],
+    ['direct', SOURCE_TYPES.MANUAL_REMOTE],
+    ['direct_pr', SOURCE_TYPES.MANUAL_REMOTE],
+    ['remote', SOURCE_TYPES.MANUAL_REMOTE],
+    ['remote_github_work', SOURCE_TYPES.MANUAL_REMOTE],
+    ['no_automation', SOURCE_TYPES.MANUAL_REMOTE],
+  ]);
+
+  return aliases.get(token) || SOURCE_TYPES.UNKNOWN;
+}
+
+function labelNames(pull = {}) {
+  return Array.isArray(pull.labels)
+    ? pull.labels
+        .map((label) => cleanString(typeof label === 'string' ? label : label?.name || ''))
+        .filter(Boolean)
+    : [];
+}
+
+function checkedLabels(lines) {
+  return lines
+    .map((line) => line.match(/^\s*[-*]\s+\[[xX]\]\s+(.+?)\s*$/))
+    .filter(Boolean)
+    .map((match) => match[1]);
+}
+
+function workflowSourceSectionLines(body) {
+  const lines = String(body || '').split(/\r?\n/);
+  const start = lines.findIndex((line) => /^#{1,6}\s+Workflow Source\s*$/i.test(line));
+  if (start < 0) {
+    return [];
+  }
+
+  const sectionLines = [];
+  for (const line of lines.slice(start + 1)) {
+    if (/^#{1,6}\s+\S/.test(line)) {
+      break;
+    }
+    sectionLines.push(line);
+  }
+  return sectionLines;
+}
+
+function startedFromLines(sectionLines) {
+  const start = sectionLines.findIndex((line) => /^\s*Started from:\s*$/i.test(line));
+  if (start < 0) {
+    const firstSubsection = sectionLines.findIndex((line) => /^\s*(Automation intent|Notes):\s*$/i.test(line));
+    return firstSubsection < 0 ? sectionLines : sectionLines.slice(0, firstSubsection);
+  }
+
+  const result = [];
+  for (const line of sectionLines.slice(start + 1)) {
+    if (/^\s*(Automation intent|Notes):\s*$/i.test(line)) {
+      break;
+    }
+    result.push(line);
+  }
+  return result;
+}
+
+function hasCheckedNoAutomationTemplate(body) {
+  const sectionLines = workflowSourceSectionLines(body);
+  if (!sectionLines.length) {
+    return false;
+  }
+  return checkedLabels(startedFromLines(sectionLines)).some((label) =>
+    NO_AUTOMATION_CHECKBOX_PATTERN.test(label)
+  );
+}
+
+function hasExplicitIssueReferencePrefix(value) {
+  const rawPrefix = String(value || '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[_[\]()`~]/g, ' ');
+  const prefix = rawPrefix
+    .trim()
+    .replace(/[>*]/g, ' ')
+    .replace(/\s+/g, ' ');
+
+  if (/\b(?:pr|pull\s+request)\s*[:#-]?\s*$/i.test(prefix)) {
+    return false;
+  }
+  if (/\b(?:known|no)\s+(?:linked\s+)?issue\s*[:#-]?\s*$/i.test(prefix)) {
+    return false;
+  }
+  // In release tasks/history, "record the already-merged ... fix #N"
+  // names a delivered change. Here "fix" is a noun, not closing intent.
+  if (hasHistoricalFixReferencePrefix(rawPrefix)) {
+    return false;
+  }
+
+  const issuePrefixPattern =
+    '(?:(?:close[sd]?|closing|fix(?:e[sd])?|fixing|resolve[sd]?|resolving|address(?:e[sd])?|addressing)(?:\\s+(?:issue|source\\s+issue|github\\s+issue))?|relate[sd]?\\s+to(?:\\s+(?:(?:[a-z-]+\\s+)?issue|source\\s+issue|github\\s+issue))?|refs?(?:\\s+(?:issue|source\\s+issue|github\\s+issue))?|references?(?:\\s+(?:issue|source\\s+issue|github\\s+issue))?|source(?:\\s*:\\s*|\\s+)issue|github\\s+issue|linked\\s+issue|issue)';
+  const inlinePattern = new RegExp(`\\b${issuePrefixPattern}\\s*[:#-]?\\s*$`, 'i');
+  if (inlinePattern.test(prefix)) {
+    return true;
+  }
+  const linePattern = new RegExp(
+    `(?:^|\\n)\\s*>?\\s*(?:[-*]\\s*)?(?:\\*\\*)?${issuePrefixPattern}(?:\\*\\*)?\\s*[:#-]?\\s*$`,
+    'i',
+  );
+  return linePattern.test(rawPrefix);
+}
+
+function hasHistoricalFixReferencePrefix(prefix) {
+  // Stay within this line: history on a preceding line must not mask a new
+  // "Fix #N" directive. Strip Markdown formatting, not clause boundaries.
+  const line = String(prefix || '').split(/\r?\n/).pop().replace(/[_[\]()`~>*]/g, ' ');
+  // Modifiers cannot cross another fix/closing verb or a coordinating clause.
+  // "previous fixes and Fix #N" ends with a new directive, not the earlier noun.
+  // Release changelogs also use "historical fixes" as a plural delivered noun.
+  return /\b(?:already[- ]merged|merged|released|previous|prior|existing|historical)\s+(?:(?!(?:and|or|but|then|close[sd]?|closing|fix(?:e[sd])?|fixing|resolve[sd]?|resolving)\b)[\w-]+\s+){0,6}fix(?:es)?\s*[:#-]?\s*$/i.test(line);
+}
+
+function extractIssueNumbersFromText(text) {
+  const value = String(text || '');
+  const issueNumbers = new Set();
+  for (const match of value.matchAll(/<!--\s*meta:issue:([0-9]+)\s*-->/gi)) {
+    const parsed = Number.parseInt(match[1], 10);
+    if (!Number.isNaN(parsed)) {
+      issueNumbers.add(parsed);
+    }
+  }
+  for (const match of value.matchAll(/#([0-9]+)/g)) {
+    if (!match[1]) {
+      continue;
+    }
+    const before = value.slice(Math.max(0, match.index - 200), match.index);
+    const token = before.split(/\s/).pop() || '';
+    if (token.includes('/')) {
+      continue;
+    }
+    if (match.index > 0 && /\w/.test(value[match.index - 1])) {
+      continue;
+    }
+    const preceding = value.slice(Math.max(0, match.index - 20), match.index);
+    if (/\b(?:run|attempt|step|job|check|version|v)\s*$/i.test(preceding)) {
+      continue;
+    }
+    if (!hasExplicitIssueReferencePrefix(value.slice(Math.max(0, match.index - 80), match.index))) {
+      continue;
+    }
+    const parsed = Number.parseInt(match[1], 10);
+    if (!Number.isNaN(parsed)) {
+      issueNumbers.add(parsed);
+    }
+  }
+  return issueNumbers;
+}
+
+function extractIssueNumberFromText(text) {
+  const issueNumbers = extractIssueNumbersFromText(text);
+  return issueNumbers.size > 0 ? Array.from(issueNumbers)[0] : null;
+}
+
+function extractClosingIssueNumbersFromText(text) {
+  const value = String(text || '');
+  const issueNumbers = new Set();
+  for (const match of value.matchAll(/#([0-9]+)/g)) {
+    const before = value.slice(Math.max(0, match.index - 100), match.index);
+    const token = before.split(/\s/).pop() || '';
+    if (token.includes('/')) {
+      continue;
+    }
+    const prefix = before
+      .replace(/\r\n?/g, '\n')
+      .replace(/[_\[\]()`~]/g, ' ')
+      .trim()
+      .replace(/[>*]/g, ' ')
+      .replace(/\s+/g, ' ');
+    // A negated verb is not closing intent. Keep this governor on the same
+    // line and immediately before the verb so it cannot hide a later directive.
+    const linePrefix = before.split(/\r?\n/).pop().replace(/[_\[\]()`~>*]/g, ' ');
+    if (/\b(?:not|never|without|avoid(?:s|ing)?|(?:do|does|did|should|would|could|must)n['’]t|can['’]t|won['’]t)\s+(?:(?:actually|directly|currently|fully|completely|yet)\s+){0,2}(?:close[sd]?|closing|fix(?:e[sd])?|fixing|resolve[sd]?|resolving)(?:\s+(?:source\s+issue|github\s+issue|issue))?\s*[:#-]?\s*$/i.test(linePrefix)) {
+      continue;
+    }
+    if (hasHistoricalFixReferencePrefix(before)) {
+      continue;
+    }
+    if (
+      !/\b(?:close[sd]?|closing|fix(?:e[sd])?|fixing|resolve[sd]?|resolving)(?:\s+(?:source\s+issue|github\s+issue|issue))?\s*[:#-]?\s*$/i.test(
+        prefix
+      )
+    ) {
+      continue;
+    }
+    const parsed = Number.parseInt(match[1], 10);
+    if (!Number.isNaN(parsed)) {
+      issueNumbers.add(parsed);
+    }
+  }
+  return issueNumbers;
+}
+
+function findIssueSourceFromPull(pull = {}) {
+  const bodyText = String(pull?.body || '');
+  const titleClosingIssueNumbers = extractClosingIssueNumbersFromText(pull?.title || '');
+  const metaIssueNumbers = new Set(
+    Array.from(bodyText.matchAll(/<!--\s*meta:issue:([0-9]+)\s*-->/gi), (match) =>
+      Number.parseInt(match[1], 10),
+    ),
+  );
+  if (metaIssueNumbers.size > 1) {
+    return { issueNumber: null, via: null, ambiguous: true, closing: true };
+  }
+  if (metaIssueNumbers.size === 1) {
+    const issueNumber = Array.from(metaIssueNumbers)[0];
+    // Metadata pins synchronized body text, but cannot silently override a
+    // different explicit closing target in the independently authored title.
+    if (Array.from(titleClosingIssueNumbers).some((target) => target !== issueNumber)) {
+      return { issueNumber: null, via: null, ambiguous: true, closing: true };
+    }
+    return { issueNumber, via: 'meta' };
+  }
+
+  // A generated mention/title binding survives synchronized issue text, which
+  // can itself contain closing references to a different issue. Explicit title
+  // closing intent retains the existing conflict checks below.
+  if (titleClosingIssueNumbers.size === 0) {
+    const relatedIssueNumbers = new Set(
+      Array.from(bodyText.matchAll(/<!--\s*meta:related-issue:([0-9]+)\s*-->/gi), (match) =>
+        Number.parseInt(match[1], 10),
+      ),
+    );
+    if (relatedIssueNumbers.size > 1) {
+      return { issueNumber: null, via: null, ambiguous: true };
+    }
+    if (relatedIssueNumbers.size === 1) {
+      return { issueNumber: Array.from(relatedIssueNumbers)[0], via: 'mention' };
+    }
+  }
+
+  const closingIssueNumbers = extractClosingIssueNumbersFromText(bodyText);
+  const explicitClosingTargets = new Set([...closingIssueNumbers, ...titleClosingIssueNumbers]);
+  if (explicitClosingTargets.size > 1) {
+    return { issueNumber: null, via: null, ambiguous: true, closing: true };
+  }
+  if (explicitClosingTargets.size === 1) {
+    return { issueNumber: Array.from(explicitClosingTargets)[0], via: 'closing' };
+  }
+
+  const bodyIssueNumbers = extractIssueNumbersFromText(bodyText);
+  for (const match of bodyText.matchAll(/<!--\s*meta:related-issue:([0-9]+)\s*-->/gi)) {
+    bodyIssueNumbers.add(Number.parseInt(match[1], 10));
+  }
+  if (bodyIssueNumbers.size === 1) {
+    const issueNumber = Array.from(bodyIssueNumbers)[0];
+    return { issueNumber, via: 'mention' };
+  }
+  if (bodyIssueNumbers.size > 1) {
+    return { issueNumber: null, via: null, ambiguous: true };
+  }
+
+  const branch = String(pull?.head?.ref || '');
+  const branchMatch = branch.match(/issue-#?([0-9]+)/i) || branch.match(/-issue-#([0-9]+)(?:$|[^0-9])/i);
+  if (branchMatch) {
+    return { issueNumber: Number.parseInt(branchMatch[1], 10), via: 'branch' };
+  }
+
+  const titleIssueNumbers = extractIssueNumbersFromText(pull?.title || '');
+  if (titleIssueNumbers.size > 1) {
+    return { issueNumber: null, via: null, ambiguous: true };
+  }
+  if (titleIssueNumbers.size === 1) {
+    return { issueNumber: Array.from(titleIssueNumbers)[0], via: 'title' };
+  }
+
+  return { issueNumber: null, via: null };
+}
+
+function extractIssueSourceFromPull(pull = {}) {
+  const { issueNumber, via } = findIssueSourceFromPull(pull);
+  return { issueNumber, via };
+}
+
+function extractIssueNumberFromPull(pull = {}) {
+  return extractIssueSourceFromPull(pull).issueNumber;
+}
+
+function parseHtmlMarker(body, name) {
+  const pattern = new RegExp(`<!--\\s*${name}\\s*:\\s*([\\s\\S]*?)\\s*-->`, 'i');
+  const match = String(body || '').match(pattern);
+  return match ? cleanString(match[1]) : '';
+}
+
+function parseWorkflowSourceBlock(body) {
+  const match = String(body || '').match(
+    /<!--\s*workflow-source:start\s*-->([\s\S]*?)<!--\s*workflow-source:end\s*-->/i,
+  );
+  if (!match) {
+    return {};
+  }
+
+  const result = {};
+  for (const line of match[1].split(/\r?\n/)) {
+    const fieldMatch = line.match(/^\s*[-*]?\s*([A-Za-z][A-Za-z0-9_-]*)\s*:\s*(.+?)\s*$/);
+    if (!fieldMatch) {
+      continue;
+    }
+    const key = normalizeToken(fieldMatch[1]);
+    const value = cleanString(fieldMatch[2]);
+    if (key && value) {
+      result[key] = value;
+    }
+  }
+  return result;
+}
+
+function parseDependencyRepairPromotionSource(body) {
+  const match = String(body || '').match(DEPENDENCY_REPAIR_PROMOTION_PATTERN);
+  if (!match) {
+    return null;
+  }
+
+  try {
+    const metadata = JSON.parse(match[1]);
+    const sourcePr = Number(metadata?.source_pr);
+    const validShas = [
+      metadata?.source_base_sha,
+      metadata?.source_head_sha,
+      metadata?.promotion_base_sha,
+    ].every((value) => /^[0-9a-f]{40}$/i.test(String(value || '')));
+    if (!Number.isInteger(sourcePr) || sourcePr <= 0 || !validShas) {
+      return null;
+    }
+    return {
+      source_pr: sourcePr,
+      source_base_sha: metadata.source_base_sha,
+      source_head_sha: metadata.source_head_sha,
+      promotion_base_sha: metadata.promotion_base_sha,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function parseConsumerSyncSource(body) {
+  const match = String(body || '').match(CONSUMER_SYNC_PATTERN);
+  if (!match) {
+    return null;
+  }
+
+  try {
+    const metadata = JSON.parse(match[1]);
+    const consumerRepo = cleanString(metadata?.consumer_repo);
+    const sourceRepository = cleanString(metadata?.source_repository);
+    const sourceSha = cleanString(metadata?.source_sha);
+    const planId = cleanString(metadata?.plan_id);
+    const sourceCommit = cleanString(metadata?.source_commit);
+    const syncBranch = cleanString(metadata?.sync_branch);
+    if (
+      metadata?.schema !== 'workflows-consumer-sync-pr/v1' ||
+      !/^[^/\s]+\/[^/\s]+$/.test(consumerRepo) ||
+      sourceRepository !== 'stranske/Workflows' ||
+      !/^sha256:[0-9a-f]{64}$/i.test(planId) ||
+      !/^[0-9a-f]{40}$/i.test(sourceCommit) ||
+      sourceSha !== sourceCommit ||
+      !/^sync\/workflows-(?:candidate|delivery)$/.test(syncBranch)
+    ) {
+      return null;
+    }
+    return {
+      schema: metadata.schema,
+      consumer_repo: consumerRepo,
+      source_repository: sourceRepository,
+      plan_id: planId,
+      source_commit: sourceCommit,
+      sync_branch: syncBranch,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function hasBoundGeneratedSyncContext(pull = {}, syncSource = parseConsumerSyncSource(pull?.body)) {
+  if (!syncSource) {
+    return false;
+  }
+
+  const labels = labelNames(pull).map((label) => label.toLowerCase());
+  const hasControlledSyncSourceLabel = labels.some(
+    (label) => SOURCE_LABELS[label] === SOURCE_TYPES.SYNC_CAMPAIGN,
+  );
+  const branch = cleanString(pull?.head?.ref);
+  const headRepo = cleanString(pull?.head?.repo?.full_name);
+  const baseRepo = cleanString(pull?.base?.repo?.full_name);
+  return (
+    labels.includes('sync') &&
+    labels.includes('automated') &&
+    hasControlledSyncSourceLabel &&
+    branch === syncSource.sync_branch &&
+    headRepo === syncSource.consumer_repo &&
+    baseRepo === syncSource.consumer_repo
+  );
+}
+
+function hasBoundVerifierCorpusHarvestContext(pull = {}) {
+  const labels = labelNames(pull).map((label) => label.toLowerCase());
+  const branch = cleanString(pull?.head?.ref);
+  const headRepo = cleanString(pull?.head?.repo?.full_name);
+  const baseRepo = cleanString(pull?.base?.repo?.full_name);
+  return (
+    branch === VERIFIER_CORPUS_HARVEST_BRANCH &&
+    headRepo === VERIFIER_CORPUS_HARVEST_REPOSITORY &&
+    baseRepo === VERIFIER_CORPUS_HARVEST_REPOSITORY &&
+    labels.includes('automation') &&
+    labels.includes('model-selection')
+  );
+}
+
+function sourceTypeFromCheckedTemplate(body) {
+  const sectionLines = workflowSourceSectionLines(body);
+  if (!sectionLines.length) {
+    return SOURCE_TYPES.UNKNOWN;
+  }
+  const checkedTypes = new Set();
+  for (const label of checkedLabels(startedFromLines(sectionLines))) {
+    for (const [sourceType, pattern] of CHECKBOX_SOURCE_PATTERNS) {
+      if (pattern.test(label)) {
+        checkedTypes.add(sourceType);
+        break;
+      }
+    }
+  }
+  return checkedTypes.size === 1 ? Array.from(checkedTypes)[0] : SOURCE_TYPES.UNKNOWN;
+}
+
+function hasNoAutomationWorkflowContext(pull = {}) {
+  const body = String(pull?.body || '');
+  const markerToken = normalizeToken(parseHtmlMarker(body, 'workflow-source'));
+  const block = parseWorkflowSourceBlock(body);
+  const blockTokens = [
+    block.origin,
+    block.source,
+    block.type,
+    block.automation,
+    block.automation_intent,
+  ].map(normalizeToken);
+  const labels = labelNames(pull).map((label) => label.toLowerCase());
+
+  return (
+    markerToken === 'no_automation'
+    || blockTokens.includes('no_automation')
+    || labels.some((label) => NO_AUTOMATION_LABELS.has(label) || NO_AUTOMATION_LABELS.has(normalizeToken(label)))
+    || hasCheckedNoAutomationTemplate(body)
+  );
+}
+
+function sourceTypeFromLabels(pull = {}) {
+  for (const label of labelNames(pull)) {
+    const sourceType = SOURCE_LABELS[label.toLowerCase()];
+    if (sourceType) {
+      return sourceType;
+    }
+  }
+  return SOURCE_TYPES.UNKNOWN;
+}
+
+function inferredSourceType(pull = {}) {
+  const branch = cleanString(pull?.head?.ref).toLowerCase();
+  const title = cleanString(pull?.title).toLowerCase();
+  const author = cleanString(pull?.user?.login).toLowerCase();
+  const labels = labelNames(pull).map((label) => label.toLowerCase());
+
+  // A branch name is author-controlled. Bind Release Please inference to the
+  // repository-owned branch and the configured release publisher identity.
+  if (branch.startsWith('release-please--branches--')) {
+    const headRepo = cleanString(pull?.head?.repo?.full_name).toLowerCase();
+    const baseRepo = cleanString(pull?.base?.repo?.full_name).toLowerCase();
+    const releaseAuthor = cleanString(
+      process.env.RELEASE_PLEASE_AUTHOR || 'github-actions[bot]',
+    ).toLowerCase();
+    return /^[^/\s]+\/[^/\s]+$/.test(baseRepo) && headRepo === baseRepo && author === releaseAuthor
+      ? SOURCE_TYPES.AUTOMATION_RUN : SOURCE_TYPES.UNKNOWN;
+  }
+  if (author.startsWith('dependabot') || branch.startsWith('dependabot/')) {
+    return SOURCE_TYPES.DEPENDABOT;
+  }
+  if (branch.startsWith('sync/') || branch.startsWith('sync-')) {
+    return SOURCE_TYPES.SYNC_CAMPAIGN;
+  }
+  if (labels.includes('campaign:sync-dependabot')) {
+    return SOURCE_TYPES.SYNC_CAMPAIGN;
+  }
+  if (author === 'github-actions[bot]' || author === 'github-actions') {
+    return SOURCE_TYPES.AUTOMATION_RUN;
+  }
+  if (/\bsync\b/.test(title)) {
+    return SOURCE_TYPES.SYNC_CAMPAIGN;
+  }
+  if (/review[-/ ]follow/.test(branch) || /\breview\s+follow[- ]?up\b/.test(title)) {
+    return SOURCE_TYPES.REVIEW_FOLLOWUP;
+  }
+  if ([
+    'feat/', 'fix/', 'docs/', 'audit/', 'chore/', 'refactor/', 'perf/', 'test/',
+  ].some((prefix) => branch.startsWith(prefix))) {
+    return SOURCE_TYPES.LOCAL_REQUEST;
+  }
+  return SOURCE_TYPES.UNKNOWN;
+}
+
+function resolvePrSourceContext(pull = {}) {
+  const body = String(pull?.body || '');
+  const block = parseWorkflowSourceBlock(body);
+  const dependencyRepairPromotion = parseDependencyRepairPromotionSource(body);
+  const consumerSyncSource = parseConsumerSyncSource(body);
+  const labels = labelNames(pull).map((label) => label.toLowerCase());
+  // The marker is supplied in untrusted PR text. Promotion labels are applied
+  // by the controlled promotion workflow after it has established provenance.
+  const trustedDependencyRepairPromotion = Boolean(
+    dependencyRepairPromotion &&
+      labels.includes('dependency:repair-promotion') &&
+      (labels.includes('workflow:source-dependabot') ||
+        labels.includes('workflow_source_dependabot')),
+  );
+  // Generated sync bodies can legitimately mention consumer issue numbers in
+  // their file summary. Only the controlled labels, stable branch, and complete
+  // immutable marker together make sync provenance authoritative over that
+  // incidental text.
+  const boundGeneratedSync = hasBoundGeneratedSyncContext(pull, consumerSyncSource);
+  // The weekly corpus harvest is a recurring data job, not an implementation
+  // of the design issue mentioned as historical background. Bind suppression
+  // to its exact repository, branch, and controlled labels so stale metadata
+  // cannot promote that provenance into a closing issue reference.
+  const boundVerifierCorpusHarvest = hasBoundVerifierCorpusHarvestContext(pull);
+  const issueSource = findIssueSourceFromPull(pull);
+  const extractedIssueNumber = issueSource?.issueNumber || null;
+  const markerType = normalizeSourceType(parseHtmlMarker(body, 'workflow-source'));
+  const blockType = normalizeSourceType(block.origin || block.source || block.type);
+  const checkboxType = sourceTypeFromCheckedTemplate(body);
+  const labelType = sourceTypeFromLabels(pull);
+  const declaredType = [markerType, blockType, checkboxType, labelType]
+    .find((type) => type !== SOURCE_TYPES.UNKNOWN);
+  const declaredNonIssue = declaredType && declaredType !== SOURCE_TYPES.GITHUB_ISSUE;
+  const explicitIssueOverride = issueSource?.via === 'closing' || issueSource?.via === 'meta';
+  // No target and conflicting targets are different states. Inference must
+  // not turn unresolved explicit lineage into a valid automation source.
+  const hasAmbiguousIssueSource = Boolean(
+    issueSource.ambiguous &&
+      !trustedDependencyRepairPromotion && !boundGeneratedSync && !boundVerifierCorpusHarvest &&
+      (!declaredNonIssue || issueSource.closing),
+  );
+  // Controlled promotion/sync provenance is authoritative: a coincidental
+  // issue reference must not route the PR through issue-body synchronization.
+  const issueNumber = trustedDependencyRepairPromotion || boundGeneratedSync || boundVerifierCorpusHarvest
+    || (declaredNonIssue && !explicitIssueOverride)
+    ? null
+    : extractedIssueNumber;
+  const noAutomation = hasNoAutomationWorkflowContext(pull);
+
+  const inferredType = inferredSourceType(pull);
+  const detectedSourceType = trustedDependencyRepairPromotion
+    ? SOURCE_TYPES.DEPENDABOT
+    : boundGeneratedSync
+    ? SOURCE_TYPES.SYNC_CAMPAIGN
+    : boundVerifierCorpusHarvest
+    ? SOURCE_TYPES.AUTOMATION_RUN
+    : hasAmbiguousIssueSource
+    ? SOURCE_TYPES.UNKNOWN
+    : issueNumber
+    ? SOURCE_TYPES.GITHUB_ISSUE
+    : [markerType, blockType, checkboxType, labelType, inferredType].find((type) => type !== SOURCE_TYPES.UNKNOWN)
+      || SOURCE_TYPES.UNKNOWN;
+  const sourceType = noAutomation && !hasAmbiguousIssueSource && detectedSourceType === SOURCE_TYPES.UNKNOWN
+    ? SOURCE_TYPES.MANUAL_REMOTE
+    : detectedSourceType;
+
+  const sourceRef =
+    (trustedDependencyRepairPromotion
+      ? `dependency-pr:#${dependencyRepairPromotion.source_pr}`
+      : boundGeneratedSync
+      ? `consumer-sync-plan:${consumerSyncSource.plan_id}`
+      : boundVerifierCorpusHarvest
+      ? 'workflow:maint-79-verifier-corpus-harvest'
+      : '') ||
+    cleanString(parseHtmlMarker(body, 'workflow-source-ref')) ||
+    cleanString(block.source_ref || block.ref || block.reference) ||
+    (issueNumber ? `#${issueNumber}` : '');
+  const lifecycle = (boundVerifierCorpusHarvest ? 'recurring_data_job' : '') ||
+    cleanString(parseHtmlMarker(body, 'workflow-lifecycle')) ||
+    cleanString(block.lifecycle || block.intended_lifecycle);
+  const automation = (boundVerifierCorpusHarvest ? 'corpus_harvest' : '') ||
+    cleanString(parseHtmlMarker(body, 'workflow-automation')) ||
+    cleanString(block.automation || block.automation_intent);
+
+  return {
+    sourceType,
+    issueNumber,
+    sourceRef,
+    lifecycle,
+    automation,
+    isKnown: sourceType !== SOURCE_TYPES.UNKNOWN,
+    isValid: VALID_SOURCE_TYPES.has(sourceType),
+    isExplicit: Boolean(
+      issueNumber || hasAmbiguousIssueSource ||
+        trustedDependencyRepairPromotion ||
+        boundGeneratedSync ||
+        boundVerifierCorpusHarvest ||
+        markerType !== SOURCE_TYPES.UNKNOWN ||
+        blockType !== SOURCE_TYPES.UNKNOWN ||
+        checkboxType !== SOURCE_TYPES.UNKNOWN ||
+        labelType !== SOURCE_TYPES.UNKNOWN ||
+        noAutomation
+    ),
+    requiresIssue: sourceType === SOURCE_TYPES.GITHUB_ISSUE || hasAmbiguousIssueSource,
+    hasAmbiguousIssueSource,
+    noAutomation,
+    isRecurringDataJob: boundVerifierCorpusHarvest,
+  };
+}
+
+function hasValidNonIssueSourceContext(pull = {}) {
+  const context = resolvePrSourceContext(pull);
+  return context.isValid && !context.requiresIssue && !context.noAutomation;
+}
+
+function formatSourceContextForLog(context = {}) {
+  const parts = [`origin=${context.sourceType || SOURCE_TYPES.UNKNOWN}`];
+  if (context.sourceRef) {
+    parts.push(`ref=${context.sourceRef}`);
+  }
+  if (context.lifecycle) {
+    parts.push(`lifecycle=${context.lifecycle}`);
+  }
+  if (context.automation) {
+    parts.push(`automation=${context.automation}`);
+  }
+  if (context.noAutomation) {
+    parts.push('no_automation=true');
+  }
+  return parts.join(' ');
+}
+
+module.exports = {
+  SOURCE_TYPES,
+  VALID_SOURCE_TYPES,
+  normalizeSourceType,
+  extractIssueNumberFromText,
+  extractIssueNumbersFromText,
+  extractClosingIssueNumbersFromText,
+  extractIssueNumberFromPull,
+  extractIssueSourceFromPull,
+  parseWorkflowSourceBlock,
+  parseDependencyRepairPromotionSource,
+  hasBoundVerifierCorpusHarvestContext,
+  sourceTypeFromCheckedTemplate,
+  sourceTypeFromLabels,
+  hasNoAutomationWorkflowContext,
+  resolvePrSourceContext,
+  hasValidNonIssueSourceContext,
+  formatSourceContextForLog,
+};

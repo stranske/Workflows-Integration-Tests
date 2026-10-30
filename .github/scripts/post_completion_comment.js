@@ -1,10 +1,12 @@
 'use strict';
 
+const { ensureRateLimitWrapped } = require('./github-rate-limited-wrapper.js');
+
 /**
  * post_completion_comment.js
  * 
- * Extracts completed checkboxes from codex-prompt.md and posts them as a PR comment.
- * This bridges the gap between Codex updating the prompt file and the status summary
+ * Extracts completed checkboxes from the agent prompt file and posts them as a PR comment.
+ * This bridges the gap between the agent updating the prompt file and the status summary
  * which reads checkbox states from PR comments.
  * 
  * The posted comment will be picked up by fetchConnectorCheckboxStates in
@@ -14,7 +16,12 @@
 const fs = require('fs');
 const path = require('path');
 
-const COMPLETION_COMMENT_MARKER = '<!-- codex-completion-checkpoint -->';
+// API contract: marker string embedded in existing PR comments
+const COMPLETION_COMMENT_MARKER = '<!-- agent-completion-checkpoint -->';
+
+function isCodeFenceLine(line) {
+  return /^\s*(```|~~~)/.test(String(line || ''));
+}
 
 /**
  * Extract checked checkboxes from markdown content.
@@ -24,8 +31,16 @@ const COMPLETION_COMMENT_MARKER = '<!-- codex-completion-checkpoint -->';
 function extractCheckedItems(content) {
   const items = [];
   const lines = String(content || '').split(/\r?\n/);
+  let inCodeBlock = false;
   
   for (const line of lines) {
+    if (isCodeFenceLine(line)) {
+      inCodeBlock = !inCodeBlock;
+      continue;
+    }
+    if (inCodeBlock) {
+      continue;
+    }
     // Match checked checkboxes: - [x] or - [X] or * [x] etc.
     const match = line.match(/^\s*[-*+]\s*\[[xX]\]\s*(.+)$/);
     if (match && match[1]) {
@@ -107,11 +122,6 @@ function buildCompletionComment(tasks, acceptance, metadata = {}) {
     lines.push('');
   }
   
-  if (tasks.length === 0 && acceptance.length === 0) {
-    lines.push('_No new completions recorded this round._');
-    lines.push('');
-  }
-  
   lines.push('<details>');
   lines.push('<summary>About this comment</summary>');
   lines.push('');
@@ -153,6 +163,7 @@ async function postCompletionComment({ github, context, core, inputs }) {
   
   // Support PR-specific prompt files to avoid merge conflicts
   // Try PR-specific file first, fall back to generic name
+  // File names are API contracts — existing belt PRs use codex-prompt*.md
   const basePromptFile = inputs.prompt_file || inputs.promptFile || 'codex-prompt.md';
   let promptFile = basePromptFile;
   const prSpecificFile = `codex-prompt-${prNumber}.md`;
@@ -186,6 +197,11 @@ async function postCompletionComment({ github, context, core, inputs }) {
   const completedAcceptance = extractCheckedItems(acceptanceSection);
   
   core.info(`Found ${completedTasks.length} completed task(s) and ${completedAcceptance.length} acceptance criteria`);
+
+  if (completedTasks.length === 0 && completedAcceptance.length === 0) {
+    core.info('No new completions detected, skipping completion comment.');
+    return { posted: false, reason: 'no-completions' };
+  }
   
   // Build the comment
   const commentBody = buildCompletionComment(completedTasks, completedAcceptance, {
@@ -251,5 +267,8 @@ module.exports = {
   extractSection,
   buildCompletionComment,
   findExistingComment,
-  postCompletionComment,
+  postCompletionComment: async function ({ github: rawGithub, context, core, inputs }) {
+    const github = await ensureRateLimitWrapped({ github: rawGithub, core, env: process.env });
+    return postCompletionComment({ github, context, core, inputs });
+  },
 };

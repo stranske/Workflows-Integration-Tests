@@ -9,6 +9,9 @@ const { resolvePromptMode } = require('./keepalive_prompt_routing');
  * Edit .github/templates/keepalive-instruction.md to change the fallback text.
  */
 const TEMPLATE_PATH = path.resolve(__dirname, '../templates/keepalive-instruction.md');
+// NOTE: Prompt files live under .github/codex/prompts/ — this directory name is
+// an API contract (baked into consumer repos and existing workflows). The prompts
+// themselves are agent-agnostic and used by all agent runners.
 const NEXT_TASK_TEMPLATE_PATH = path.resolve(__dirname, '../codex/prompts/keepalive_next_task.md');
 const FIX_TEMPLATE_PATH = path.resolve(__dirname, '../codex/prompts/fix_ci_failures.md');
 const VERIFY_TEMPLATE_PATH = path.resolve(__dirname, '../codex/prompts/verifier_acceptance_check.md');
@@ -24,6 +27,16 @@ const TEMPLATE_PATHS = {
  * @type {Map<string,string>}
  */
 const instructionCache = new Map();
+
+const BLACK_PREFLIGHT_HEADER = '## Pre-Commit Formatting Gate (Black)';
+const BLACK_PREFLIGHT_BLOCK = [
+  BLACK_PREFLIGHT_HEADER,
+  '',
+  '**Before you commit or push any Python (`.py`) changes, you MUST:**',
+  '1. Run Black to format the relevant files (line length 100).',
+  '2. Verify formatting passes CI by running: `black --check --line-length 100 --exclude \'(\\.workflows-lib|node_modules)\' .`',
+  '3. If the check fails, do NOT commit/push; format again until it passes.',
+].join('\n');
 
 function normalise(value) {
   return String(value ?? '').trim();
@@ -104,16 +117,26 @@ function loadInstruction(templatePath, { allowDefaultFallback = true } = {}) {
 function getKeepaliveInstruction(options = {}) {
   const params = options && typeof options === 'object' ? options : {};
   const resolved = resolveTemplatePath(params);
-  return loadInstruction(resolved.path, { allowDefaultFallback: true });
+  const content = loadInstruction(resolved.path, { allowDefaultFallback: true });
+
+  if (resolved.mode !== 'normal' && resolved.mode !== 'fix_ci') {
+    return content;
+  }
+
+  if (content.includes(BLACK_PREFLIGHT_HEADER)) {
+    return content;
+  }
+
+  return [BLACK_PREFLIGHT_BLOCK, '', content].join('\n');
 }
 
 /**
  * Returns the full keepalive instruction with @agent prefix.
  * 
- * @param {string} [agent='codex'] - The agent alias to mention
+ * @param {string} [agent] - The agent alias to mention (defaults to registry default)
  * @returns {string} The full instruction with @agent prefix
  */
-function getKeepaliveInstructionWithMention(agent = 'codex', options = {}) {
+function getKeepaliveInstructionWithMention(agent, options = {}) {
   let resolvedAgent = agent;
   let params = options;
 
@@ -122,7 +145,13 @@ function getKeepaliveInstructionWithMention(agent = 'codex', options = {}) {
     resolvedAgent = params.agent;
   }
 
-  const alias = String(resolvedAgent || '').trim() || 'codex';
+  let _defaultAgent = 'codex';
+  try {
+    const { loadAgentRegistry } = require('./agent_registry.js');
+    const reg = loadAgentRegistry();
+    _defaultAgent = reg.default_agent || 'codex';
+  } catch (_) { /* registry not available */ }
+  const alias = String(resolvedAgent || '').trim() || _defaultAgent;
   return `@${alias} ${getKeepaliveInstruction(params)}`;
 }
 

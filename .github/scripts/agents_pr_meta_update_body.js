@@ -10,10 +10,23 @@
  * - Building and updating PR body with preamble and status blocks
  */
 
+const { PR_TEMPLATE_SKELETON_LINES, visibleChecklistContent, stripPrTemplateControls } = require('./issue_scope_parser');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const childProcess = require('child_process');
+const { ensureRateLimitWrapped } = require('./github-rate-limited-wrapper.js');
+const { isRateLimitError: classifyRateLimitError } = require('./error_classifier');
+const {
+  extractIssueNumbersFromText,
+  extractClosingIssueNumbersFromText,
+  extractIssueSourceFromPull,
+  formatSourceContextForLog,
+  normalizeSourceType,
+  resolvePrSourceContext,
+  SOURCE_TYPES,
+  VALID_SOURCE_TYPES,
+} = require('./source_context.js');
 
 class RateLimitError extends Error {
   constructor(message, options = {}) {
@@ -54,31 +67,147 @@ function extractSection(body, heading) {
 }
 
 function ensureChecklist(text) {
-  const lines = String(text || '')
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-  if (!lines.length) {
+  const raw = String(text || '');
+  const lines = raw.split(/\r?\n/);
+  if (!lines.some((line) => line.trim())) {
     return '- [ ] —';
   }
-  return lines
-    .map((line) => {
-      // Skip lines that are already checkboxes
-      if (line.startsWith('- [')) {
-        return line;
+
+  const updated = [];
+  let inCodeBlock = false;
+  let lastWasList = false;
+
+  for (const rawLine of lines) {
+    if (isCodeFenceLine(rawLine)) {
+      inCodeBlock = !inCodeBlock;
+      updated.push(rawLine.trimEnd());
+      lastWasList = false;
+      continue;
+    }
+    if (inCodeBlock) {
+      updated.push(rawLine);
+      lastWasList = false;
+      continue;
+    }
+
+    if (!rawLine.trim()) {
+      updated.push('');
+      lastWasList = false;
+      continue;
+    }
+
+    const trimmed = rawLine.trim();
+    if (trimmed.startsWith('<!--') && trimmed.endsWith('-->')) {
+      updated.push(trimmed);
+      lastWasList = false;
+      continue;
+    }
+    if (trimmed.startsWith('#')) {
+      updated.push(trimmed);
+      lastWasList = false;
+      continue;
+    }
+
+    const listMatch = rawLine.match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/);
+    if (listMatch) {
+      const indent = listMatch[1];
+      const bullet = listMatch[2];
+      const remainder = listMatch[3].trim();
+      if (!remainder) {
+        updated.push(trimmed);
+      } else if (/^\[[ xX]\]/.test(remainder)) {
+        updated.push(`${indent}${bullet} ${remainder}`);
+      } else {
+        updated.push(`${indent}${bullet} [ ] ${remainder}`);
       }
-      // Skip HTML comments - they are informational, not actionable
-      if (line.startsWith('<!--') && line.endsWith('-->')) {
-        return line;
-      }
-      // Skip section headers
-      if (line.startsWith('#')) {
-        return line;
-      }
-      // Convert other lines to checkboxes
-      return `- [ ] ${line}`;
-    })
-    .join('\n');
+      lastWasList = true;
+      continue;
+    }
+
+    if (lastWasList && /^\s+\S/.test(rawLine)) {
+      updated.push(rawLine.trimEnd());
+      continue;
+    }
+
+    updated.push(`- [ ] ${trimmed}`);
+    lastWasList = true;
+  }
+
+  return updated.join('\n');
+}
+
+function coalesceWrappedChecklist(text) {
+  const raw = String(text || '');
+  const lines = raw.split(/\r?\n/);
+  if (!lines.some((line) => line.trim())) {
+    return raw;
+  }
+
+  const updated = [];
+  let inCodeBlock = false;
+  let pendingIndex = null;
+  let pendingChecked = false;
+  let pendingText = '';
+  let pendingPrefix = '';
+
+  const joinerPattern = /\b(and|or|with|to|so|for|of|into|that|in)\s*$/i;
+
+  const parseCheckbox = (line) => {
+    const match = line.match(/^(\s*)([-*+]|\d+[.)])\s+\[(x|X| )\]\s+(.+)$/);
+    if (!match) {
+      return null;
+    }
+    return {
+      indent: match[1],
+      bullet: match[2],
+      checked: match[3].toLowerCase() === 'x',
+      text: match[4].trim(),
+    };
+  };
+
+  for (const line of lines) {
+    if (isCodeFenceLine(line)) {
+      inCodeBlock = !inCodeBlock;
+      updated.push(line);
+      pendingIndex = null;
+      continue;
+    }
+    if (inCodeBlock) {
+      updated.push(line);
+      pendingIndex = null;
+      continue;
+    }
+
+    const parsed = parseCheckbox(line);
+    if (!parsed) {
+      updated.push(line);
+      pendingIndex = null;
+      continue;
+    }
+
+    if (
+      pendingIndex !== null &&
+      (joinerPattern.test(pendingText)
+        || (/^[a-z]/.test(parsed.text) && !/[.!?]$/.test(pendingText)))
+    ) {
+      const mergedText = `${pendingText} ${parsed.text}`.replace(/\s+/g, ' ').trim();
+      const mergedChecked = pendingChecked || parsed.checked;
+      const checkbox = mergedChecked ? '[x]' : '[ ]';
+      updated[pendingIndex] = `${pendingPrefix}${checkbox} ${mergedText}`;
+      pendingText = mergedText;
+      pendingChecked = mergedChecked;
+      continue;
+    }
+
+    const checkbox = parsed.checked ? '[x]' : '[ ]';
+    pendingPrefix = `${parsed.indent}${parsed.bullet} `;
+    pendingText = parsed.text;
+    pendingChecked = parsed.checked;
+    pendingIndex = updated.length;
+    updated.push(`${pendingPrefix}${checkbox} ${parsed.text}`);
+  }
+
+  return updated.join('\n');
 }
 
 function extractBlock(body, marker) {
@@ -109,7 +238,13 @@ function extractContextSectionWithPython(issueBody, comments, core) {
     const output = childProcess.execFileSync(
       'python3',
       ['scripts/langchain/context_extractor.py', '--input-file', issuePath, '--comments-file', commentsPath],
-      { encoding: 'utf8' },
+      {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ISSUE_PR_CONTEXT_WORKFLOW: 'agents-pr-meta-v4',
+        },
+      },
     );
     return String(output || '').trim();
   } catch (error) {
@@ -271,11 +406,25 @@ function buildContextBlock(contextText, { owner, repo } = {}) {
   ].join('\n');
 }
 
+function isCodeFenceLine(line) {
+  return /^\s*(```|~~~)/.test(String(line || ''));
+}
+
 function parseCheckboxStates(block) {
   const states = new Map();
   const lines = String(block || '').split(/\r?\n/);
+  let inCodeBlock = false;
   for (const line of lines) {
-    const match = line.match(/^- \[(x| )\]\s*(.+)$/i);
+    if (isCodeFenceLine(line)) {
+      inCodeBlock = !inCodeBlock;
+      continue;
+    }
+    if (inCodeBlock) {
+      continue;
+    }
+    // Dash and numbered checklist items both carry durable completion state
+    // (coverage contract items are commonly authored as "1. [x] ...").
+    const match = line.match(/^\s*(?:[-*+]|\d+[.)])\s+\[(x| )\]\s*(.+)$/i);
     if (match) {
       const checked = match[1].toLowerCase() === 'x';
       const text = match[2].trim();
@@ -308,29 +457,68 @@ function resolveAgentType({ inputs = {}, env = {}, pr = {} } = {}) {
   return '';
 }
 
+function prLabelNames(pr = {}) {
+  return new Set(
+    (Array.isArray(pr.labels) ? pr.labels : [])
+      .map((label) => normalise(typeof label === 'string' ? label : label?.name))
+      .filter(Boolean),
+  );
+}
+
+function isReleasePleasePr(pr = {}) {
+  const labels = prLabelNames(pr);
+  const title = normalise(pr.title);
+  const body = normalise(pr.body);
+  const headRef = normalise(pr.head?.ref || pr.headRefName);
+
+  return (
+    headRef.startsWith('release-please--branches--') ||
+    labels.has('autorelease: pending') ||
+    /^chore\([^)]*\):\s*release\b/i.test(title) ||
+    /\brelease-please\b/i.test(body)
+  );
+}
+
 /**
  * Merge checkbox states from existingStates into newContent.
- * Only unchecked items `- [ ]` in newContent get their state restored.
+ * Only unchecked checklist items in newContent get their state restored.
  * This is intentional: already checked items in newContent preserve their state,
  * while unchecked items can be restored from the previous body state.
+ * Numbered items (`1. [ ]`) are included so acceptance-contract lists survive
+ * PR-meta refresh the same way dash bullets do.
  */
 function mergeCheckboxStates(newContent, existingStates) {
   if (!existingStates || existingStates.size === 0) {
     return newContent;
   }
   const lines = String(newContent || '').split(/\r?\n/);
-  // Only match unchecked `- [ ]` items - checked items preserve their state
-  return lines.map((line) => {
-    const match = line.match(/^- \[( )\]\s*(.+)$/);
+  // Match unchecked dash or numbered checklist items; checked items preserve state
+  const updated = [];
+  let inCodeBlock = false;
+  for (const line of lines) {
+    if (isCodeFenceLine(line)) {
+      inCodeBlock = !inCodeBlock;
+      updated.push(line);
+      continue;
+    }
+    if (inCodeBlock) {
+      updated.push(line);
+      continue;
+    }
+    const match = line.match(/^(\s*)([-*+]|\d+[.)]) \[( )\]\s*(.+)$/);
     if (match) {
-      const text = match[2].trim();
+      const indent = match[1];
+      const bullet = match[2];
+      const text = match[4].trim();
       const normalized = text.replace(/^-\s*/, '').trim().toLowerCase();
       if (existingStates.has(normalized)) {
-        return `- [x] ${text}`;
+        updated.push(`${indent}${bullet} [x] ${text}`);
+        continue;
       }
     }
-    return line;
-  }).join('\n');
+    updated.push(line);
+  }
+  return updated.join('\n');
 }
 
 /**
@@ -338,10 +526,174 @@ function mergeCheckboxStates(newContent, existingStates) {
  * These bots post checked checkboxes that should be captured and
  * merged into the PR body's Automated Status Summary.
  */
-const CONNECTOR_BOT_LOGINS = [
-  'chatgpt-codex-connector[bot]',
-  'github-actions[bot]',  // Sometimes used for automation
+// Bot logins that report task completion.
+// Load from registry when available + hardcoded system bots.
+let CONNECTOR_BOT_LOGINS = [
+  'github-actions[bot]',
+  'stranske-keepalive[bot]',
+  'agents-workflows-bot[bot]',
 ];
+try {
+  const { getAllAutomationLogins } =
+    require('./agent_registry.js');
+  const logins = getAllAutomationLogins();
+  CONNECTOR_BOT_LOGINS = [
+    ...logins, ...CONNECTOR_BOT_LOGINS,
+  ];
+} catch {
+  CONNECTOR_BOT_LOGINS.unshift(
+    'chatgpt-codex-connector[bot]'
+  );
+}
+
+// API contract: marker string embedded in existing PR comments
+const COMPLETION_COMMENT_MARKER = '<!-- codex-completion-checkpoint -->';
+const COMPLETION_WARNING_MARKER = '<!-- completion-author-warning -->';
+
+function normaliseLogin(value) {
+  return String(value || '').trim().toLowerCase().replace(/\[bot]$/, '');
+}
+
+async function fetchIssueComments(github, owner, repo, prNumber, core) {
+  try {
+    return await github.paginate(github.rest.issues.listComments, {
+      owner,
+      repo,
+      issue_number: prNumber,
+      per_page: 100,
+    });
+  } catch (error) {
+    if (core) {
+      core.warning(`Failed to fetch PR comments: ${error.message}`);
+    }
+    return [];
+  }
+}
+
+function parseConnectorCheckboxStatesFromComments(comments, core) {
+  const states = new Map();
+  const allowed = new Set(CONNECTOR_BOT_LOGINS.map(normaliseLogin));
+  const connectorComments = Array.isArray(comments)
+    ? comments.filter((comment) => allowed.has(normaliseLogin(comment?.user?.login)))
+    : [];
+
+  if (connectorComments.length === 0) {
+    return states;
+  }
+
+  for (const comment of connectorComments) {
+    const commentStates = parseCheckboxStates(comment.body);
+    for (const [key] of commentStates) {
+      states.set(key, true);
+    }
+  }
+
+  if (states.size > 0 && core) {
+    core.info(`Found ${states.size} checked checkbox(es) from connector bot comments`);
+  }
+
+  return states;
+}
+
+function findUnauthorizedCompletionAuthors(comments) {
+  const allowed = new Set(CONNECTOR_BOT_LOGINS.map(normaliseLogin));
+  const found = new Map();
+  for (const comment of Array.isArray(comments) ? comments : []) {
+    const body = String(comment?.body || '');
+    if (!body.includes(COMPLETION_COMMENT_MARKER)) {
+      continue;
+    }
+    const rawLogin = String(comment?.user?.login || '').trim();
+    const login = normaliseLogin(rawLogin);
+    if (!login || allowed.has(login)) {
+      continue;
+    }
+    if (!found.has(login)) {
+      found.set(login, rawLogin || login);
+    }
+  }
+  return Array.from(found.values());
+}
+
+function buildCompletionAuthorWarningBody(logins, { resolved = false } = {}) {
+  const lines = [COMPLETION_WARNING_MARKER];
+  if (resolved) {
+    lines.push('## ✅ Completion Comment Authors Authorized');
+    lines.push('');
+    lines.push('No unauthorized completion checkpoint authors were detected in the latest scan.');
+    return lines.join('\n');
+  }
+
+  lines.push('## ⚠️ Completion Comment Author Not Authorized');
+  lines.push('');
+  lines.push('The PR has completion checkpoint comments from the following login(s):');
+  for (const login of logins) {
+    lines.push(`- ${login}`);
+  }
+  lines.push('');
+  lines.push('Automated Status Summary only merges completion checkboxes from authorized bots.');
+  lines.push('If this bot should be trusted, add it to `CONNECTOR_BOT_LOGINS` in `agents_pr_meta_update_body.js` (Workflows repo and consumer templates).');
+  return lines.join('\n');
+}
+
+async function upsertCompletionAuthorWarning({ github, owner, repo, prNumber, comments, unauthorizedLogins, core }) {
+  try {
+    const list = Array.isArray(unauthorizedLogins) ? unauthorizedLogins.filter(Boolean) : [];
+    const existing = (Array.isArray(comments) ? comments : [])
+      .find((comment) => comment?.body && comment.body.includes(COMPLETION_WARNING_MARKER));
+    const updateComment = async (commentId, body, label) => {
+      await withRetries(
+        () => github.rest.issues.updateComment({
+          owner,
+          repo,
+          comment_id: commentId,
+          body,
+        }),
+        { description: label, core },
+      );
+    };
+    const createComment = async (body, label) => {
+      await withRetries(
+        () => github.rest.issues.createComment({
+          owner,
+          repo,
+          issue_number: prNumber,
+          body,
+        }),
+        { description: label, core },
+      );
+    };
+
+    if (list.length === 0) {
+      if (existing) {
+        const body = buildCompletionAuthorWarningBody([], { resolved: true });
+        await updateComment(existing.id, body, `issues.updateComment #${existing.id}`);
+        if (core) {
+          core.info('Updated completion author warning comment to resolved state.');
+        }
+      }
+      return;
+    }
+
+    const body = buildCompletionAuthorWarningBody(list);
+    if (existing) {
+      await updateComment(existing.id, body, `issues.updateComment #${existing.id}`);
+      if (core) {
+        core.info('Updated completion author warning comment.');
+      }
+      return;
+    }
+
+    await createComment(body, `issues.createComment #${prNumber}`);
+    if (core) {
+      core.info('Posted completion author warning comment.');
+    }
+  } catch (error) {
+    if (core) {
+      core.warning(`Failed to upsert completion author warning: ${error.message}`);
+    }
+  }
+}
 
 /**
  * Fetch comments from connector bots and extract checked checkbox states.
@@ -355,44 +707,8 @@ const CONNECTOR_BOT_LOGINS = [
  * @returns {Promise<Map<string, boolean>>} Map of normalized checkbox text to checked state
  */
 async function fetchConnectorCheckboxStates(github, owner, repo, prNumber, core) {
-  const states = new Map();
-  
-  try {
-    const comments = await github.paginate(github.rest.issues.listComments, {
-      owner,
-      repo,
-      issue_number: prNumber,
-      per_page: 100,
-    });
-    
-    // Filter to connector bot comments only
-    const connectorComments = comments.filter((c) => 
-      c.user && CONNECTOR_BOT_LOGINS.includes(c.user.login)
-    );
-    
-    if (connectorComments.length === 0) {
-      return states;
-    }
-    
-    // Parse checkbox states from all connector comments
-    // Later comments override earlier ones (most recent state wins)
-    for (const comment of connectorComments) {
-      const commentStates = parseCheckboxStates(comment.body);
-      for (const [key] of commentStates) {
-        states.set(key, true);
-      }
-    }
-    
-    if (states.size > 0 && core) {
-      core.info(`Found ${states.size} checked checkbox(es) from connector bot comments`);
-    }
-  } catch (error) {
-    if (core) {
-      core.warning(`Failed to fetch connector comments: ${error.message}`);
-    }
-  }
-  
-  return states;
+  const comments = await fetchIssueComments(github, owner, repo, prNumber, core);
+  return parseConnectorCheckboxStatesFromComments(comments, core);
 }
 
 /**
@@ -401,7 +717,7 @@ async function fetchConnectorCheckboxStates(github, owner, repo, prNumber, core)
  * when a PR is created via the API or UI for agent-managed branches.
  * 
  * @param {string} body - PR body that may contain template content
- * @returns {string} Body with template content stripped (everything before first marker)
+ * @returns {string} Body with only an unfilled template prefix stripped
  */
 function stripPrTemplateContent(body) {
   if (!body) return '';
@@ -420,9 +736,19 @@ function stripPrTemplateContent(body) {
     firstMarkerIndex = statusStart;
   }
   
-  // If we found a marker and there's content before it, strip that content
+  // Remove only a positively identified empty template skeleton. Authored prose,
+  // filled Summary/Testing sections and reviewer work survive regardless of lists.
   if (firstMarkerIndex > 0) {
-    return body.slice(firstMarkerIndex);
+    const prefix = stripPrTemplateControls(body.slice(0, firstMarkerIndex));
+    const visible = prefix.replace(/<!--[\s\S]*?-->/g, '');
+    const lines = visible.split('\n').map((line) => line.trim()).filter(Boolean);
+    const skeleton = stripPrTemplateControls(PR_TEMPLATE_SKELETON_LINES.join('\n'))
+      .split('\n').map((line) => line.trim()).filter(Boolean);
+    // A partial heading or a rearranged/repeated skeleton can be authored text.
+    // Require the entire template after removing its choice controls.
+    const isUnfilledTemplate = lines.length === skeleton.length &&
+      lines.every((line, index) => line === skeleton[index]);
+    return isUnfilledTemplate ? body.slice(firstMarkerIndex) : prefix + body.slice(firstMarkerIndex);
   }
   
   return body;
@@ -435,7 +761,25 @@ function upsertBlock(body, marker, replacement) {
   const startIndex = body.indexOf(start);
   const endIndex = body.indexOf(end);
   if (startIndex !== -1 && endIndex !== -1 && endIndex > startIndex) {
-    return `${body.slice(0, startIndex)}${replacement}${body.slice(endIndex + end.length)}`;
+    // Replace the first marker pair in place
+    let result = `${body.slice(0, startIndex)}${replacement}${body.slice(endIndex + end.length)}`;
+
+    // Remove any duplicate marker pairs left by concurrent writers
+    let hadDuplicates = false;
+    let limit = 10;
+    while (limit-- > 0) {
+      const dupStart = result.indexOf(start, startIndex + replacement.length);
+      const dupEnd = result.indexOf(end, dupStart + start.length);
+      if (dupStart !== -1 && dupEnd !== -1 && dupEnd > dupStart) {
+        result = `${result.slice(0, dupStart)}${result.slice(dupEnd + end.length)}`;
+        hadDuplicates = true;
+      } else {
+        break;
+      }
+    }
+
+    // Collapse triple+ newlines left by removed blocks
+    return hadDuplicates ? result.replace(/\n{3,}/g, '\n\n') : result;
   }
 
   const trimmed = body.trimEnd();
@@ -531,25 +875,12 @@ function isRateLimitError(error) {
   if (!error) {
     return false;
   }
+  // Preserve the module-local RateLimitError sentinel; delegate everything
+  // else to the centralized predicate in error_classifier.js.
   if (error instanceof RateLimitError) {
     return true;
   }
-  const status = typeof error.status === 'number' ? error.status : null;
-  const message = error instanceof Error ? error.message : String(error);
-  const messageLower = message.toLowerCase();
-  if (status === 429) {
-    return true;
-  }
-  if (status !== 403) {
-    return false;
-  }
-  if (messageLower.includes('rate limit')) {
-    return true;
-  }
-  const headers = error?.response?.headers || {};
-  const remainingRaw = headers['x-ratelimit-remaining'] ?? headers['X-RateLimit-Remaining'];
-  const remaining = Number(remainingRaw);
-  return Number.isFinite(remaining) && remaining <= 0;
+  return classifyRateLimitError(error);
 }
 
 // ========== Status Block Functions ==========
@@ -606,8 +937,287 @@ function selectLatestWorkflows(runs) {
   return latest;
 }
 
+const SELF_OBSERVING_WORKFLOW_NAMES = new Set([
+  'agents pr meta manager',
+  'agents pr event hub',
+  'pr 46 dependency repair contract',
+]);
+
+const SELF_OBSERVING_WORKFLOW_PATHS = new Set([
+  '.github/workflows/agents-pr-meta-v4.yml',
+  '.github/workflows/agents-80-pr-event-hub.yml',
+  '.github/workflows/pr-46-dependency-repair-contract.yml',
+]);
+
+const DEPENDENCY_CONTRACT_NAME = 'PR 46 Dependency Repair Contract';
+
+function isDependencyContractRun(run) {
+  return String(run?.name || '').trim().toLowerCase() === DEPENDENCY_CONTRACT_NAME.toLowerCase()
+    || String(run?.path || '').trim().split('@')[0].toLowerCase()
+      === '.github/workflows/pr-46-dependency-repair-contract.yml';
+}
+
+function isSelfObservingWorkflowRun(run) {
+  const name = String(run?.name || '').trim().toLowerCase();
+  const workflowPath = String(run?.path || '').trim().split('@')[0].toLowerCase();
+  return SELF_OBSERVING_WORKFLOW_NAMES.has(name)
+    || SELF_OBSERVING_WORKFLOW_PATHS.has(workflowPath);
+}
+
+function filterWorkflowRunsForStatus(workflowRuns) {
+  const filtered = new Map();
+  for (const [key, run] of workflowRuns || new Map()) {
+    if (isDependencyContractRun(run)) {
+      // PR 46 validates provenance as well as observing body edits. Keep its
+      // last completed result, but never echo the run URL that caused an edit.
+      if (run.status === 'completed' && run.conclusion) {
+        filtered.set(DEPENDENCY_CONTRACT_NAME.toLowerCase(), {
+          ...run, name: DEPENDENCY_CONTRACT_NAME, html_url: '',
+        });
+      }
+    } else if (!isSelfObservingWorkflowRun(run)) {
+      filtered.set(key, run);
+    }
+  }
+  return filtered;
+}
+
+async function collectStatusWorkflowRuns({github, owner, repo, headSha, core}) {
+  // Without an implementation head, neither endpoint can provide exact-head evidence.
+  if (!normalise(headSha)) return new Map();
+  const response = await withRetries(
+    () => github.rest.actions.listWorkflowRunsForRepo({
+      owner, repo, head_sha: headSha, per_page: 100,
+    }),
+    {description: 'list workflow runs', core},
+  );
+  const exactRuns = (response.data.workflow_runs || []).filter(run => run.head_sha === headSha);
+  const runs = filterWorkflowRunsForStatus(selectLatestWorkflows(exactRuns.filter(run =>
+    !isDependencyContractRun(run) || (run.status === 'completed' && run.conclusion),
+  ).map(run => isDependencyContractRun(run) ? {...run, name: DEPENDENCY_CONTRACT_NAME} : run)));
+  if (exactRuns.some(isDependencyContractRun) && !runs.has(DEPENDENCY_CONTRACT_NAME.toLowerCase())) {
+    // A new body edit starts PR 46 again. Resolve only the last completed
+    // exact-head result so its pending/completed cycle cannot retrigger itself.
+    try {
+      const contractResponse = await withRetries(
+        () => github.rest.actions.listWorkflowRuns({
+          owner, repo, workflow_id: 'pr-46-dependency-repair-contract.yml',
+          head_sha: headSha, status: 'completed', per_page: 1,
+        }),
+        {description: 'recover completed dependency contract', core, attempts: 1},
+      );
+      const completed = filterWorkflowRunsForStatus(selectLatestWorkflows(
+        (contractResponse.data.workflow_runs || []).filter(run =>
+          run.head_sha === headSha && isDependencyContractRun(run),
+        ),
+      ));
+      for (const [key, run] of completed) runs.set(key, run);
+    } catch (error) {
+      if (error?.status !== 404) throw error;
+      core?.warning('Dependency contract workflow unavailable; consult PR checks.');
+    }
+  }
+  if (!runs.has('gate')) {
+    // Metadata-only edited events can fill the latest page. Recover the real
+    // exact-head Gate directly rather than paging through thousands of observers.
+    try {
+      const gateResponse = await withRetries(
+        () => github.rest.actions.listWorkflowRuns({
+          owner, repo, workflow_id: 'pr-00-gate.yml', head_sha: headSha, per_page: 1,
+        }),
+        {description: 'recover exact-head Gate', core, attempts: 1},
+      );
+      for (const run of gateResponse.data.workflow_runs || []) {
+        if (run.head_sha === headSha && String(run.name || '').toLowerCase() === 'gate') {
+          runs.set('gate', run);
+        }
+      }
+    } catch (error) {
+      if (error?.status !== 404) throw error;
+      core?.warning('Gate workflow unavailable; leaving its status unknown.');
+    }
+  }
+  return runs;
+}
+
 function fallbackChecklist(message) {
   return `- [ ] ${message}`;
+}
+
+function issueLabelNames(issue = {}) {
+  return Array.isArray(issue.labels)
+    ? issue.labels.map((label) => String(typeof label === 'string' ? label : label?.name || '').trim())
+    : [];
+}
+
+function isCampaignIssue(issue = {}) {
+  const labels = new Set(issueLabelNames(issue));
+  return labels.has('campaign:sync-dependabot') || labels.has('campaign:active');
+}
+
+function buildSourceContextRepairCommentBody(prNumber) {
+  return [
+    '<!-- missing-issue-warning -->',
+    '### Workflow source needed',
+    '',
+    `PR #${prNumber} needs either a linked GitHub issue or one valid non-issue Workflow Source before PR metadata automation can manage it safely.`,
+    '',
+    'Please do one of:',
+    '',
+    '- Add `<!-- meta:issue:123 -->` or a normal `Closes #123` / `Related to #123` line.',
+    '- Check one `Workflow Source` option in the PR body.',
+    '- Add a hidden marker such as `<!-- workflow-source:local_request -->`, `<!-- workflow-source:manual_remote -->`, `<!-- workflow-source:review_followup -->`, `<!-- workflow-source:sync_campaign -->`, or `<!-- workflow-source:dependabot -->`.',
+    '- Add a workflow source label such as `workflow:source-direct-pr`, `workflow:source-local-request`, `workflow:source-review-followup`, `workflow:source-sync`, or `workflow:no-automation`.',
+    '',
+    'Once a valid source is present, this warning will not be reposted.',
+  ].join('\n');
+}
+
+async function updateIssueCommentWithRetry({ github, owner, repo, commentId, body, core }) {
+  return withRetries(
+    () => github.rest.issues.updateComment({
+      owner,
+      repo,
+      comment_id: commentId,
+      body,
+    }),
+    { description: `issues.updateComment #${commentId}`, core },
+  );
+}
+
+async function createIssueCommentWithRetry({ github, owner, repo, issueNumber, body, core }) {
+  return withRetries(
+    () => github.rest.issues.createComment({
+      owner,
+      repo,
+      issue_number: issueNumber,
+      body,
+    }),
+    { description: `issues.createComment #${issueNumber}`, core },
+  );
+}
+
+function buildSourceContextResolvedCommentBody(prNumber, sourceContext) {
+  const hasLinkedIssue = Boolean(sourceContext?.issueNumber);
+  const issueRequired = Boolean(sourceContext?.requiresIssue || sourceContext?.sourceType === SOURCE_TYPES.GITHUB_ISSUE);
+  return [
+    '<!-- missing-issue-warning -->',
+    '### Workflow source detected',
+    '',
+    `PR #${prNumber} now has valid workflow source context (${formatSourceContextForLog(sourceContext)}).`,
+    '',
+    hasLinkedIssue
+      ? 'A linked GitHub issue is present for this PR.'
+      : issueRequired
+        ? 'A linked GitHub issue is required but was not detected for this PR.'
+        : 'No linked GitHub issue is required for this PR.',
+  ].join('\n');
+}
+
+function parseHtmlMarker(body, name) {
+  const pattern = new RegExp(`<!--\\s*${name}\\s*:\\s*([\\s\\S]*?)\\s*-->`, 'i');
+  const match = String(body || '').match(pattern);
+  return match ? String(match[1] || '').trim() : '';
+}
+
+function resolveExplicitNonIssueWorkflowSourceContext(pr = {}) {
+  const body = String(pr.body || '');
+  const sourceType = normalizeSourceType(parseHtmlMarker(body, 'workflow-source'));
+  if (
+    !VALID_SOURCE_TYPES.has(sourceType)
+    || sourceType === SOURCE_TYPES.GITHUB_ISSUE
+    || sourceType === SOURCE_TYPES.UNKNOWN
+  ) {
+    return null;
+  }
+
+  const sourceRef = parseHtmlMarker(body, 'workflow-source-ref');
+  const lifecycle = parseHtmlMarker(body, 'workflow-lifecycle');
+  const automation = parseHtmlMarker(body, 'workflow-automation');
+  return {
+    sourceType,
+    issueNumber: null,
+    sourceRef,
+    lifecycle,
+    automation,
+    isKnown: true,
+    isValid: true,
+    isExplicit: true,
+    requiresIssue: false,
+  };
+}
+
+function extractExplicitIssueSyncNumbers(pr = {}) {
+  const issueNumbers = new Set();
+  for (const text of [pr.title, pr.body]) {
+    for (const issueNumber of extractIssueNumbersFromText(text)) {
+      issueNumbers.add(issueNumber);
+    }
+  }
+  return issueNumbers;
+}
+
+function hasExplicitIssueSyncReference(pr = {}) {
+  return extractExplicitIssueSyncNumbers(pr).size > 0;
+}
+
+function resolveNonIssueWorkflowSourceContextForBodySync(pr = {}, issueNumber = null) {
+  const explicitNonIssueSourceContext = resolveExplicitNonIssueWorkflowSourceContext(pr);
+  if (!explicitNonIssueSourceContext) {
+    return null;
+  }
+  const closingIntentNumbers = new Set();
+  for (const text of [pr.title, pr.body]) {
+    for (const number of extractClosingIssueNumbersFromText(text)) {
+      closingIntentNumbers.add(number);
+    }
+    for (const match of String(text || '').matchAll(/<!--\s*meta:issue:([0-9]+)\s*-->/gi)) {
+      closingIntentNumbers.add(Number.parseInt(match[1], 10));
+    }
+  }
+  const targetIssueNumber = Number.parseInt(issueNumber, 10);
+  if (
+    closingIntentNumbers.size > 0 &&
+    (!Number.isFinite(targetIssueNumber) ||
+      targetIssueNumber <= 0 ||
+      closingIntentNumbers.has(targetIssueNumber))
+  ) {
+    return null;
+  }
+  return explicitNonIssueSourceContext;
+}
+
+async function resolveSourceContextRepairComment({
+  github,
+  owner,
+  repo,
+  prNumber,
+  comments,
+  sourceContext,
+  core,
+}) {
+  const marker = '<!-- missing-issue-warning -->';
+  const existingWarning = comments.find((c) => c.body && c.body.includes(marker));
+  if (!existingWarning) {
+    return false;
+  }
+
+  const resolvedBody = buildSourceContextResolvedCommentBody(prNumber, sourceContext);
+  if (existingWarning.body === resolvedBody) {
+    core?.info?.(`Workflow source repair comment already resolved (id: ${existingWarning.id})`);
+    return false;
+  }
+
+  await updateIssueCommentWithRetry({
+    github,
+    owner,
+    repo,
+    commentId: existingWarning.id,
+    body: resolvedBody,
+    core,
+  });
+  core?.info?.(`Resolved workflow source repair comment (id: ${existingWarning.id})`);
+  return true;
 }
 
 function buildPreamble(sections) {
@@ -615,7 +1225,18 @@ function buildPreamble(sections) {
   
   // Add reference to source issue if available
   if (sections.issueNumber) {
+    // Omitted provenance keeps the legacy helper API's closing behavior.
+    const relationOnly = ['mention', 'title'].includes(sections.via);
+    const marker = relationOnly ? 'meta:related-issue' : 'meta:issue';
+    lines.push(`<!-- ${marker}:${sections.issueNumber} -->`);
     lines.push(`> **Source:** Issue #${sections.issueNumber}`, '');
+    if (relationOnly) {
+      lines.push(`Related to #${sections.issueNumber}`, '');
+    } else if (isCampaignIssue(sections.sourceIssue)) {
+      lines.push(`Related to campaign issue #${sections.issueNumber}`, '');
+    } else {
+      lines.push(`Closes #${sections.issueNumber}`, '');
+    }
   }
   
   if (sections.summary && sections.summary.trim()) {
@@ -637,6 +1258,7 @@ function buildPreamble(sections) {
 function buildStatusBlock({scope, contextSection, tasks, acceptance, headSha, workflowRuns, requiredChecks, existingBody, connectorStates, core, agentType, owner, repo}) {
   const statusLines = ['<!-- auto-status-summary:start -->', '## Automated Status Summary'];
   const isCliAgent = Boolean(agentType && String(agentType).trim());
+  const statusWorkflowRuns = filterWorkflowRunsForStatus(workflowRuns);
 
   const existingBlock = extractBlock(existingBody || '', 'auto-status-summary');
   const existingStates = parseCheckboxStates(existingBlock);
@@ -671,13 +1293,19 @@ function buildStatusBlock({scope, contextSection, tasks, acceptance, headSha, wo
   }
 
   statusLines.push('#### Tasks');
-  let tasksFormatted = tasks ? ensureChecklist(tasks) : fallbackChecklist('Tasks section missing from source issue.');
+  const tasksNormalized = tasks ? coalesceWrappedChecklist(tasks) : '';
+  let tasksFormatted = tasksNormalized
+    ? ensureChecklist(tasksNormalized)
+    : fallbackChecklist('Tasks section missing from source issue.');
   tasksFormatted = mergeCheckboxStates(tasksFormatted, mergedStates);
   statusLines.push(tasksFormatted);
   statusLines.push('');
 
   statusLines.push('#### Acceptance criteria');
-  let acceptanceFormatted = acceptance ? ensureChecklist(acceptance) : fallbackChecklist('Acceptance criteria section missing from source issue.');
+  const acceptanceNormalized = acceptance ? coalesceWrappedChecklist(acceptance) : '';
+  let acceptanceFormatted = acceptanceNormalized
+    ? ensureChecklist(acceptanceNormalized)
+    : fallbackChecklist('Acceptance criteria section missing from source issue.');
   acceptanceFormatted = mergeCheckboxStates(acceptanceFormatted, mergedStates);
   statusLines.push(acceptanceFormatted);
   statusLines.push('');
@@ -685,7 +1313,7 @@ function buildStatusBlock({scope, contextSection, tasks, acceptance, headSha, wo
   if (!isCliAgent) {
     statusLines.push(`**Head SHA:** ${headSha}`);
 
-    const latestRuns = Array.from(workflowRuns.values()).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+    const latestRuns = Array.from(statusWorkflowRuns.values()).filter(run => !isDependencyContractRun(run)).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
     let latestLine = '—';
     if (latestRuns.length > 0) {
       const gate = latestRuns.find((run) => (run.name || '').toLowerCase() === 'gate');
@@ -697,26 +1325,30 @@ function buildStatusBlock({scope, contextSection, tasks, acceptance, headSha, wo
 
     const requiredParts = [];
     for (const name of requiredChecks) {
-      const run = Array.from(workflowRuns.values()).find((item) => (item.name || '').toLowerCase() === name.toLowerCase());
+      const run = Array.from(statusWorkflowRuns.values()).find((item) => (item.name || '').toLowerCase() === name.toLowerCase());
       if (!run) {
-        requiredParts.push(`${name}: ⏸️ not started`);
+        requiredParts.push(SELF_OBSERVING_WORKFLOW_NAMES.has(name.toLowerCase())
+          ? `${name}: reported separately in PR checks`
+          : `${name}: ⏸️ not started`);
       } else {
         const status = combineStatus(run);
-        requiredParts.push(`${name}: ${status.icon} ${status.label}`);
+        requiredParts.push(`${name}: ${status.icon} ${status.label}${isDependencyContractRun(run) ? ' (last completed; current run in PR checks)' : ''}`);
       }
     }
     statusLines.push(`**Required:** ${requiredParts.length > 0 ? requiredParts.join(', ') : '—'}`);
     statusLines.push('');
 
     const table = ['| Workflow / Job | Result | Logs |', '|----------------|--------|------|'];
-    const runs = Array.from(workflowRuns.values()).sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+    const runs = Array.from(statusWorkflowRuns.values()).sort((a, b) => (a.name || '').localeCompare(b.name || ''));
 
     if (runs.length === 0) {
       table.push('| _(no workflow runs yet for this commit)_ | — | — |');
     } else {
       for (const run of runs) {
         const status = combineStatus(run);
-        const link = run.html_url ? `[View run](${run.html_url})` : '—';
+        const link = isDependencyContractRun(run)
+          ? 'Last completed result; current run in PR checks'
+          : run.html_url ? `[View run](${run.html_url})` : '—';
         table.push(`| ${run.name || 'Unnamed workflow'} | ${status.icon} ${status.label} | ${link} |`);
       }
     }
@@ -830,7 +1462,16 @@ async function discoverPr({github, context, core, inputs}) {
 
 // ========== Main Entry Point ==========
 
-async function run({github, context, core, inputs}) {
+async function run({github: rawGithub, context, core, inputs}) {
+  // Wrap github client with rate-limit-aware retry
+  let github;
+  try {
+    github = await ensureRateLimitWrapped({ github: rawGithub, core, env: process.env });
+  } catch (error) {
+    core?.warning?.(`Failed to wrap GitHub client: ${error.message} - using raw client`);
+    github = rawGithub;
+  }
+
   try {
     const {owner, repo} = context.repo;
   // Support dual-checkout pattern: WORKFLOWS_SCRIPTS_PATH points to where the
@@ -838,26 +1479,17 @@ async function run({github, context, core, inputs}) {
   const scriptsBase = process.env.WORKFLOWS_SCRIPTS_PATH || process.env.GITHUB_WORKSPACE || process.cwd();
   
   // Load external helper scripts
-  let extractIssueNumberFromPull;
   let parseScopeTasksAcceptanceSections;
 
   try {
-    const keepalivePath = path.resolve(scriptsBase, '.github/scripts/agents_pr_meta_keepalive.js');
     const parserPath = path.resolve(scriptsBase, '.github/scripts/issue_scope_parser.js');
 
-    if (!fs.existsSync(keepalivePath)) {
-      throw new Error(`Keepalive script not found at ${keepalivePath}`);
-    }
     if (!fs.existsSync(parserPath)) {
       throw new Error(`Parser script not found at ${parserPath}`);
     }
 
-    extractIssueNumberFromPull = require(keepalivePath).extractIssueNumberFromPull;
     parseScopeTasksAcceptanceSections = require(parserPath).parseScopeTasksAcceptanceSections;
     
-    if (typeof extractIssueNumberFromPull !== 'function') {
-      throw new Error('extractIssueNumberFromPull is not exported from keepalive script');
-    }
     if (typeof parseScopeTasksAcceptanceSections !== 'function') {
       throw new Error('parseScopeTasksAcceptanceSections is not exported from parser script');
     }
@@ -888,10 +1520,98 @@ async function run({github, context, core, inputs}) {
     return;
   }
 
-  const issueNumber = extractIssueNumberFromPull(pr);
+  if (isReleasePleasePr(pr)) {
+    core.info(`PR #${pr.number} is a release-please PR; skipping issue-sourced PR body sync.`);
+    return;
+  }
+
+  const sourceContext = resolvePrSourceContext(pr);
+  const issueNumber = sourceContext.issueNumber;
+  if (sourceContext.noAutomation) {
+    core.info(
+      `PR #${pr.number} has automation disabled (${formatSourceContextForLog(sourceContext)}); skipping PR body update.`,
+    );
+    if (sourceContext.isValid && (!sourceContext.requiresIssue || sourceContext.issueNumber)) {
+      try {
+        const comments = await github.paginate(github.rest.issues.listComments, {
+          owner,
+          repo,
+          issue_number: pr.number,
+        });
+        await resolveSourceContextRepairComment({
+          github,
+          owner,
+          repo,
+          prNumber: pr.number,
+          comments,
+          sourceContext,
+          core,
+        });
+      } catch (error) {
+        core.warning(`Failed to resolve workflow source repair comment: ${error.message}`);
+      }
+    } else {
+      core.warning(
+        `PR #${pr.number} has automation disabled but lacks valid non-issue workflow source context (${formatSourceContextForLog(sourceContext)}); leaving repair comment unresolved.`,
+      );
+    }
+    return;
+  }
+
+  const explicitNonIssueSourceContext = resolveNonIssueWorkflowSourceContextForBodySync(pr, issueNumber);
+  if (explicitNonIssueSourceContext) {
+    core.info(
+      `PR #${pr.number} has explicit non-issue workflow source context (${formatSourceContextForLog(explicitNonIssueSourceContext)}); skipping issue-sourced body sync.`,
+    );
+    try {
+      const comments = await github.paginate(github.rest.issues.listComments, {
+        owner,
+        repo,
+        issue_number: pr.number,
+      });
+      await resolveSourceContextRepairComment({
+        github,
+        owner,
+        repo,
+        prNumber: pr.number,
+        comments,
+        sourceContext: explicitNonIssueSourceContext,
+        core,
+      });
+    } catch (error) {
+      core.warning(`Failed to resolve workflow source repair comment: ${error.message}`);
+    }
+    return;
+  }
+
   if (!issueNumber) {
+    if (sourceContext.isValid && !sourceContext.requiresIssue) {
+      core.info(
+        `PR #${pr.number} has valid non-issue workflow source context (${formatSourceContextForLog(sourceContext)}); skipping issue-sourced body sync.`,
+      );
+      try {
+        const comments = await github.paginate(github.rest.issues.listComments, {
+          owner,
+          repo,
+          issue_number: pr.number,
+        });
+        await resolveSourceContextRepairComment({
+          github,
+          owner,
+          repo,
+          prNumber: pr.number,
+          comments,
+          sourceContext,
+          core,
+        });
+      } catch (error) {
+        core.warning(`Failed to resolve workflow source repair comment: ${error.message}`);
+      }
+      return;
+    }
+
     const marker = '<!-- missing-issue-warning -->';
-    const warningMsg = `Unable to determine source issue for PR #${pr.number}. The PR title, branch name, or body must contain the issue number (e.g. #123, branch: issue-123, or the hidden marker <!-- meta:issue:123 -->).`;
+    const warningMsg = `Unable to determine workflow source context for PR #${pr.number}. Add a GitHub issue reference or another valid Workflow Source entry.`;
     core.warning(warningMsg);
 
     try {
@@ -902,17 +1622,30 @@ async function run({github, context, core, inputs}) {
       });
       // Find existing warning comment by marker to enable upsert pattern
       const existingWarning = comments.find((c) => c.body && c.body.includes(marker));
-      const commentBody = `${marker}\n⚠️ **Action Required**: ${warningMsg}`;
+      const commentBody = buildSourceContextRepairCommentBody(pr.number);
       
       if (existingWarning) {
-        // Update existing comment (avoids duplicates from race conditions)
-        core.info(`Warning comment already exists (id: ${existingWarning.id}), skipping duplicate`);
+        if (existingWarning.body !== commentBody) {
+          await updateIssueCommentWithRetry({
+            github,
+            owner,
+            repo,
+            commentId: existingWarning.id,
+            body: commentBody,
+            core,
+          });
+          core.info(`Updated workflow source repair comment (id: ${existingWarning.id})`);
+        } else {
+          core.info(`Workflow source repair comment already exists (id: ${existingWarning.id})`);
+        }
       } else {
-        await github.rest.issues.createComment({
+        await createIssueCommentWithRetry({
+          github,
           owner,
           repo,
-          issue_number: pr.number,
-          body: commentBody
+          issueNumber: pr.number,
+          body: commentBody,
+          core,
         });
       }
     } catch (error) {
@@ -927,6 +1660,25 @@ async function run({github, context, core, inputs}) {
     {description: `issues.get #${issueNumber}`, core},
   );
   const issueBody = issueResponse.data.body || '';
+
+  try {
+    const comments = await github.paginate(github.rest.issues.listComments, {
+      owner,
+      repo,
+      issue_number: pr.number,
+    });
+    await resolveSourceContextRepairComment({
+      github,
+      owner,
+      repo,
+      prNumber: pr.number,
+      comments,
+      sourceContext,
+      core,
+    });
+  } catch (error) {
+    core.warning(`Failed to resolve workflow source repair comment: ${error.message}`);
+  }
 
   if (!issueBody) {
     core.warning(`Issue #${issueNumber} has no body content`);
@@ -973,39 +1725,20 @@ async function run({github, context, core, inputs}) {
   let contextSection = extractSection(issueBody, 'Context for Agent')
     || extractBlock(pr.body || '', 'context')
     || '';
-  if (!String(contextSection || '').trim()) {
-    let issueComments = [];
-    try {
-      issueComments = await github.paginate(github.rest.issues.listComments, {
-        owner,
-        repo,
-        issue_number: issueNumber,
-        per_page: 100,
-      });
-    } catch (error) {
-      core.warning(`Failed to fetch issue comments for context extraction: ${error.message}`);
-    }
-    const commentBodies = Array.isArray(issueComments)
-      ? issueComments
-        .map((comment) => String(comment?.body || '').trim())
-        .filter(Boolean)
-      : [];
-    contextSection = extractContextSectionWithPython(issueBody, commentBodies, core);
-  }
   contextSection = augmentContextWithRelatedIssues(contextSection, issueBody);
 
-  const preamble = buildPreamble({summary, testing, ci, issueNumber});
+  const preamble = buildPreamble({
+    summary,
+    testing,
+    ci,
+    issueNumber,
+    sourceIssue: issueResponse.data,
+    via: extractIssueSourceFromPull(pr).via,
+  });
 
-  const workflowRunResponse = await withRetries(
-    () => github.rest.actions.listWorkflowRunsForRepo({
-      owner,
-      repo,
-      head_sha: pr.head.sha,
-      per_page: 100,
-    }),
-    {description: 'list workflow runs', core},
-  );
-  const workflowRuns = selectLatestWorkflows(workflowRunResponse.data.workflow_runs || []);
+  const workflowRuns = await collectStatusWorkflowRuns({
+    github, owner, repo, headSha: pr.head.sha, core,
+  });
 
   const requiredChecksRaw = await fetchRequiredChecks(github, owner, repo, pr.base.ref, core);
   // Avoid mutating the returned array - create a new one with 'gate' appended if needed
@@ -1013,8 +1746,23 @@ async function run({github, context, core, inputs}) {
     ? [...requiredChecksRaw, 'gate']
     : requiredChecksRaw;
 
+  const issueComments = await fetchIssueComments(github, owner, repo, pr.number, core);
   // Fetch checkbox states from connector bot comments to merge into status summary
-  const connectorStates = await fetchConnectorCheckboxStates(github, owner, repo, pr.number, core);
+  const connectorStates = parseConnectorCheckboxStatesFromComments(issueComments, core);
+  const unauthorizedAuthors = findUnauthorizedCompletionAuthors(issueComments);
+  try {
+    await upsertCompletionAuthorWarning({
+      github,
+      owner,
+      repo,
+      prNumber: pr.number,
+      comments: issueComments,
+      unauthorizedLogins: unauthorizedAuthors,
+      core,
+    });
+  } catch (error) {
+    core.warning(`Completion author warning skipped: ${error.message}`);
+  }
 
   const agentType = resolveAgentType({ inputs, env: process.env, pr });
 
@@ -1073,6 +1821,7 @@ module.exports = {
   normalizeWhitespace,
   extractSection,
   ensureChecklist,
+  coalesceWrappedChecklist,
   extractBlock,
   extractContextSectionWithPython,
   extractIssueRefsFromText,
@@ -1080,10 +1829,27 @@ module.exports = {
   parseCheckboxStates,
   mergeCheckboxStates,
   fetchConnectorCheckboxStates,
+  fetchIssueComments,
+  parseConnectorCheckboxStatesFromComments,
+  findUnauthorizedCompletionAuthors,
+  buildCompletionAuthorWarningBody,
+  upsertCompletionAuthorWarning,
   stripPrTemplateContent,
   upsertBlock,
+  filterWorkflowRunsForStatus,
+  collectStatusWorkflowRuns,
   buildContextBlock,
   buildPreamble,
+  buildSourceContextRepairCommentBody,
+  buildSourceContextResolvedCommentBody,
+  prLabelNames,
+  isReleasePleasePr,
+  resolveExplicitNonIssueWorkflowSourceContext,
+  extractExplicitIssueSyncNumbers,
+  hasExplicitIssueSyncReference,
+  resolveNonIssueWorkflowSourceContextForBodySync,
+  resolveSourceContextRepairComment,
+  isCampaignIssue,
   buildStatusBlock,
   withRetries,
   RateLimitError,

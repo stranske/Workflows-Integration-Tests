@@ -1,5 +1,8 @@
 'use strict';
 
+const { ensureRateLimitWrapped } = require('./github-rate-limited-wrapper.js');
+const { isRateLimitError } = require('./error_classifier');
+
 const DOC_EXTENSIONS = [
   '.md',
   '.mdx',
@@ -71,7 +74,7 @@ const DOCKERFILE_SUFFIXES = ['/dockerfile', '\\dockerfile'];
 const WORKFLOW_PREFIX = '.github/workflows/';
 
 function normalizeCase(value) {
-  return (value || '').toLowerCase();
+  return String(value || '').toLowerCase();
 }
 
 function normalizeSlashes(value) {
@@ -154,16 +157,26 @@ function isWorkflowFile(filename) {
   return normalized.startsWith(WORKFLOW_PREFIX);
 }
 
-function isRateLimitError(error) {
+function isNonFatalListFilesError(error) {
   if (!error) {
     return false;
   }
+  if (isRateLimitError(error)) {
+    return true;
+  }
   const status = error.status || error?.response?.status;
-  if (status !== 403) {
-    return false;
+  if ([401, 403, 404, 422].includes(status)) {
+    return true;
   }
   const message = String(error.message || error?.response?.data?.message || '').toLowerCase();
-  return message.includes('rate limit') || message.includes('ratelimit');
+  return (
+    message.includes('resource not accessible by integration') ||
+    message.includes('insufficient permission') ||
+    message.includes('requires higher permissions') ||
+    message.includes('not found') ||
+    message.includes('unprocessable') ||
+    message.includes('validation failed')
+  );
 }
 
 async function listChangedFiles({ github, context }) {
@@ -173,25 +186,42 @@ async function listChangedFiles({ github, context }) {
     return [];
   }
   try {
-    const iterator = github.paginate.iterator(github.rest.pulls.listFiles, {
+    const files = [];
+    const params = {
       owner: context.repo.owner,
       repo: context.repo.repo,
       pull_number: number,
       per_page: 100,
-    });
-    const files = [];
-    for await (const page of iterator) {
-      if (Array.isArray(page.data)) {
-        for (const item of page.data) {
+    };
+    if (typeof github?.paginate?.iterator === 'function') {
+      const iterator = github.paginate.iterator(github.rest.pulls.listFiles, params);
+      for await (const page of iterator) {
+        if (Array.isArray(page.data)) {
+          for (const item of page.data) {
+            if (item && typeof item.filename === 'string') {
+              files.push(item.filename);
+            }
+          }
+        }
+      }
+      return files;
+    }
+
+    if (typeof github?.paginate === 'function') {
+      const items = await github.paginate(github.rest.pulls.listFiles, params);
+      if (Array.isArray(items)) {
+        for (const item of items) {
           if (item && typeof item.filename === 'string') {
             files.push(item.filename);
           }
         }
       }
+      return files;
     }
-    return files;
+
+    throw new Error('GitHub paginate API is unavailable');
   } catch (error) {
-    if (isRateLimitError(error)) {
+    if (isNonFatalListFilesError(error)) {
       return null;
     }
     throw error;
@@ -199,7 +229,10 @@ async function listChangedFiles({ github, context }) {
 }
 
 function classifyChanges(filenames) {
-  const changedFiles = Array.from(new Set(filenames.filter(Boolean)));
+  const values = Array.isArray(filenames)
+    ? filenames
+    : (typeof filenames === 'string' ? [filenames] : []);
+  const changedFiles = Array.from(new Set(values.filter(Boolean).map(value => String(value))));
   const hasChanges = changedFiles.length > 0;
   const nonDocFiles = changedFiles.filter(filename => !isDocumentationFile(filename));
   const docOnly = hasChanges ? nonDocFiles.length === 0 : true;
@@ -259,7 +292,7 @@ async function detectChanges({ github, context, core, files, fetchFiles } = {}) 
       workflow_changed: 'true',
     };
     const warn = core?.warning ? core.warning.bind(core) : console.warn.bind(console);
-    warn('Rate limit reached while determining changed files; assuming code changes (but not docker).');
+    warn('Unable to determine changed files via API; assuming code changes (but not docker).');
     if (core) {
       for (const [key, value] of Object.entries(outputs)) {
         core.setOutput(key, value);
@@ -296,7 +329,16 @@ async function detectChanges({ github, context, core, files, fetchFiles } = {}) 
 }
 
 module.exports = {
-  detectChanges,
+  detectChanges: async function ({ github: rawGithub, context, core, files, fetchFiles } = {}) {
+    let github = rawGithub;
+    try {
+      github = await ensureRateLimitWrapped({ github: rawGithub, core, env: process.env });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      core?.warning?.(`Failed to enable rate-limit wrapper for detect-changes: ${message}`);
+    }
+    return detectChanges({ github, context, core, files, fetchFiles });
+  },
   classifyChanges,
   isDocumentationFile,
   isDockerRelated,

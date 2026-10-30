@@ -48,6 +48,9 @@ const TRANSIENT_PATTERNS = [
   'codex-session',
   'existing changes',
   'how would you like me to proceed',
+  'fetch failed',
+  'network error',
+  'aborterror',
 ];
 
 const AUTH_PATTERNS = [
@@ -136,6 +139,65 @@ function matchesPattern(message, patterns) {
   return patterns.some((pattern) => message.includes(pattern));
 }
 
+function normaliseHeaders(headers) {
+  if (!headers || typeof headers !== 'object') {
+    return {};
+  }
+  return Object.entries(headers).reduce((acc, [key, value]) => {
+    acc[String(key).toLowerCase()] = value;
+    return acc;
+  }, {});
+}
+
+// Message substrings that, on a 403, indicate a rate-limit rather than a
+// genuine permission/scope failure. Kept narrow on purpose: a bare 403 is NOT
+// a rate limit (see isRateLimitError) — that over-broad match was the latent
+// bug this predicate centralizes away.
+const RATE_LIMIT_MESSAGE_PATTERNS = [
+  'rate limit',
+  'rate-limited',
+  'ratelimit',
+  'api rate',
+  'secondary rate',
+  'too many requests',
+  'abuse detection',
+];
+
+/**
+ * Determine whether an error represents a GitHub rate-limit condition.
+ *
+ * Returns true ONLY when:
+ *   - the status is 429, OR
+ *   - the status is 403 AND the message indicates a rate limit OR a rate-limit
+ *     header reports exhaustion (`x-ratelimit-remaining <= 0`).
+ *
+ * A 403 that is NOT a rate limit (e.g. "Resource not accessible by integration")
+ * returns false — this is the fix for the over-broad `status === 403` predicate
+ * that previously misrouted genuine permission failures into rate-limit backoff.
+ *
+ * @param {Error|Object} error
+ * @returns {boolean}
+ */
+function isRateLimitError(error) {
+  if (!error) {
+    return false;
+  }
+  const status = getStatusCode(error);
+  if (status === 429) {
+    return true;
+  }
+  if (status === 403) {
+    const message = normaliseMessage(error);
+    if (matchesPattern(message, RATE_LIMIT_MESSAGE_PATTERNS)) {
+      return true;
+    }
+    const headers = normaliseHeaders(error?.response?.headers || error?.headers);
+    const remaining = Number.parseInt(headers['x-ratelimit-remaining'], 10);
+    return Number.isFinite(remaining) && remaining <= 0;
+  }
+  return false;
+}
+
 function classifyByStatus(status, message) {
   if (status === 401) {
     return ERROR_CATEGORIES.auth;
@@ -174,6 +236,10 @@ function classifyByMessage(message) {
   if (matchesPattern(message, TRANSIENT_PATTERNS)) {
     return ERROR_CATEGORIES.transient;
   }
+  // normaliseMessage lowercases classifier input before this branch.
+  if (/\bmissing\s+[a-z][a-z0-9_.-]*\s+auth\s*:\s*set\s+(?:the\s+)?[a-z][a-z0-9_]{2,}\b/.test(message)) {
+    return ERROR_CATEGORIES.auth;
+  }
   if (matchesPattern(message, AUTH_PATTERNS)) {
     return ERROR_CATEGORIES.auth;
   }
@@ -186,17 +252,35 @@ function classifyByMessage(message) {
   return null;
 }
 
+const TRANSIENT_NETWORK_CODES = new Set([
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ETIMEDOUT',
+  'EAI_AGAIN',
+  'ENOTFOUND',
+]);
+
 function classifyError(error) {
   const message = normaliseMessage(error);
   const preview = message ? message.slice(0, 50) : 'unknown';
-  // eslint-disable-next-line no-console
-  console.log(`[error_classifier] Classifying error: ${preview}`);
+  if (process.env.RUNNER_DEBUG === '1') {
+    // eslint-disable-next-line no-console
+    console.log(`[error_classifier] Classifying error: ${preview}`);
+  }
   const status = getStatusCode(error);
 
   const statusCategory = status ? classifyByStatus(status, message) : null;
   const messageCategory = classifyByMessage(message);
+  const causeCode = String(error?.cause?.code || '').toUpperCase();
+  const ownCode = !status && Object.prototype.hasOwnProperty.call(error || {}, 'code')
+    ? String(error.code).toUpperCase()
+    : '';
+  const networkTransient = TRANSIENT_NETWORK_CODES.has(causeCode) || TRANSIENT_NETWORK_CODES.has(ownCode)
+    || error?.name === 'AbortError';
 
-  const category = statusCategory || messageCategory || ERROR_CATEGORIES.unknown;
+  const category = networkTransient
+    ? ERROR_CATEGORIES.transient
+    : (statusCategory || messageCategory || ERROR_CATEGORIES.unknown);
 
   return {
     category,
@@ -213,5 +297,6 @@ function suggestRecoveryAction(category) {
 module.exports = {
   ERROR_CATEGORIES,
   classifyError,
+  isRateLimitError,
   suggestRecoveryAction,
 };

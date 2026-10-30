@@ -1,6 +1,8 @@
 'use strict';
 
-const { paginateWithBackoff, withBackoff } = require('./api-helpers.js');
+const { paginateWithBackoff, withBackoff } = require('./github-api-with-retry.js');
+const { getGithubApiCache } = require('./github-api-cache-client');
+const { ensureRateLimitWrapped } = require('./github-rate-limited-wrapper.js');
 
 const KEEPALIVE_LABEL = 'agents:keepalive';
 const AGENT_LABEL_PREFIX = 'agent:';
@@ -11,14 +13,62 @@ const PAUSE_LABEL = 'agents:paused';
 const DEFAULT_RUN_CAP = 1;
 const MIN_RUN_CAP = 1;
 const MAX_RUN_CAP = 5;
-const AUTOMATION_LOGINS = new Set(['chatgpt-codex-connector', 'stranske-automation-bot']);
+// Load automation logins from registry when available;
+// keep hardcoded fallback for environments without checkout.
+let AUTOMATION_LOGINS;
+try {
+  const { getAllAutomationLogins } =
+    require('./agent_registry.js');
+  AUTOMATION_LOGINS =
+    new Set(getAllAutomationLogins());
+} catch {
+  AUTOMATION_LOGINS = new Set([
+    'chatgpt-codex-connector',
+    'stranske-automation-bot',
+  ]);
+}
 const ORCHESTRATOR_WORKFLOW_FILE = 'agents-70-orchestrator.yml';
-const WORKER_WORKFLOW_FILE = 'agents-72-codex-belt-worker.yml';
+const WORKER_WORKFLOW_FILES = [
+  'agents-72-codex-belt-worker.yml',
+];
 const RECENT_COMPLETED_LOOKBACK_SECONDS = 300; // 5 minutes
 
 // Rate limit retry configuration - now handled by api-helpers
 const RATE_LIMIT_MAX_RETRIES = 3;
 const RATE_LIMIT_BASE_DELAY_MS = 2000;
+
+// getGithubApiCache is now the single shared factory from
+// github-api-cache-client.js (sentinel __githubApiCache).
+
+async function fetchPullRequestCached({ github, owner, repo, prNumber, core }) {
+  if (!github?.rest?.pulls?.get || !owner || !repo) {
+    return null;
+  }
+  const number = Number(prNumber);
+  if (!Number.isFinite(number) || number <= 0) {
+    return null;
+  }
+  const cache = getGithubApiCache({ github, core });
+  const key = cache.buildPrCacheKey({ owner, repo, number, resource: 'pulls.get' });
+  return cache.getOrSet({
+    key,
+    fetcher: async () => {
+      const response = await withBackoff(
+        () => github.rest.pulls.get({ owner, repo, pull_number: number }),
+        { core, maxRetries: RATE_LIMIT_MAX_RETRIES, baseDelay: RATE_LIMIT_BASE_DELAY_MS }
+      );
+      const data = response?.data;
+      if (!data) {
+        const error = new Error('pull request data unavailable');
+        if (response && typeof response === 'object') {
+          error.status = response.status;
+        }
+        throw error;
+      }
+      return data;
+    },
+  });
+}
 
 /**
  * Sleep for a given number of milliseconds.
@@ -27,23 +77,6 @@ const RATE_LIMIT_BASE_DELAY_MS = 2000;
  */
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/**
- * Check if an error is a GitHub rate limit error.
- * @param {Error|unknown} error
- * @returns {boolean}
- */
-function isRateLimitError(error) {
-  if (!error) return false;
-  const message = error instanceof Error ? error.message : String(error);
-  const status = error?.status || error?.response?.status;
-  return (
-    status === 403 ||
-    status === 429 ||
-    /rate\s*limit/i.test(message) ||
-    /secondary\s*rate\s*limit/i.test(message)
-  );
 }
 
 function toInteger(value) {
@@ -178,7 +211,11 @@ function isAutomationStatusComment(comment) {
     return true;
   }
   if (AUTOMATION_LOGINS.has(login)) {
-    const looksLikeInstruction = lower.startsWith('@codex') || lower.includes('<!-- codex-keepalive-marker');
+    const looksLikeInstruction =
+      /^@(codex|claude)\b/.test(lower) ||
+      lower.includes('<!-- agent-keepalive-marker') ||
+      lower.includes('<!-- codex-keepalive-marker') ||
+      lower.includes('<!-- agent-activation-marker');
     if (!looksLikeInstruction) {
       return true;
     }
@@ -556,7 +593,7 @@ async function countActive({
   if (workflowFiles.length === 0) {
     workflowFiles = [ORCHESTRATOR_WORKFLOW_FILE];
     if (includeWorker) {
-      workflowFiles.push(WORKER_WORKFLOW_FILE);
+      workflowFiles.push(...WORKER_WORKFLOW_FILES);
     }
   }
 
@@ -702,16 +739,17 @@ async function countActive({
   };
 
   for (const workflowFile of workflowFiles) {
-    const label = workflowFile === WORKER_WORKFLOW_FILE ? 'worker' : 'orchestrator';
+    const label = WORKER_WORKFLOW_FILES.includes(workflowFile) ? 'worker' : 'orchestrator';
     for (const status of statuses) {
       try {
-        const runs = await paginateWithBackoff(github, github.rest.actions.listWorkflowRuns, {
+        const listParams = {
           owner,
           repo,
           workflow_id: workflowFile,
           status,
           per_page: 100,
-        }, { core });
+        };
+        const runs = await paginateWithBackoff(github, github.rest.actions.listWorkflowRuns, listParams, { core });
         for (const run of runs) {
           const runId = Number(run?.id || 0);
           if (!Number.isFinite(runId) || runId <= 0) {
@@ -720,10 +758,6 @@ async function countActive({
           if (runIds.has(runId)) {
             continue;
           }
-          if (!(await runMatchesPr(run))) {
-            continue;
-          }
-
           if (status === 'completed') {
             if (!includeRecentCompleted) {
               continue;
@@ -732,6 +766,9 @@ async function countActive({
             if (completedAt < recentCutoff) {
               continue;
             }
+          }
+          if (!(await runMatchesPr(run))) {
+            continue;
           }
 
           runIds.add(runId);
@@ -780,11 +817,10 @@ async function evaluateRunCapForPr({
 
   let pull;
   try {
-    const response = await withBackoff(
-      () => github.rest.pulls.get({ owner, repo, pull_number: number }),
-      { core, maxRetries: RATE_LIMIT_MAX_RETRIES, baseDelay: RATE_LIMIT_BASE_DELAY_MS }
-    );
-    pull = response.data;
+    pull = await fetchPullRequestCached({ github, owner, repo, prNumber: number, core });
+    if (!pull) {
+      throw new Error('pull request data unavailable');
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (core?.warning) {
@@ -893,11 +929,10 @@ async function evaluateKeepaliveGate({ core, github, context, options = {} }) {
   let pr = pullRequest || null;
   if (!pr) {
     try {
-      const response = await withBackoff(
-        () => github.rest.pulls.get({ owner, repo, pull_number: prNumber }),
-        { core, maxRetries: RATE_LIMIT_MAX_RETRIES, baseDelay: RATE_LIMIT_BASE_DELAY_MS }
-      );
-      pr = response.data;
+      pr = await fetchPullRequestCached({ github, owner, repo, prNumber, core });
+      if (!pr) {
+        throw new Error('pull request data unavailable');
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return {
@@ -1084,7 +1119,16 @@ async function evaluateKeepaliveGate({ core, github, context, options = {} }) {
 }
 
 module.exports = {
-  evaluateKeepaliveGate,
-  countActive,
-  evaluateRunCapForPr,
+  evaluateKeepaliveGate: async function ({ core, github: rawGithub, context, options = {} }) {
+    const github = await ensureRateLimitWrapped({ github: rawGithub, core, env: process.env });
+    return evaluateKeepaliveGate({ core, github, context, options });
+  },
+  countActive: async function ({ github: rawGithub, core, ...rest }) {
+    const github = await ensureRateLimitWrapped({ github: rawGithub, core, env: process.env });
+    return countActive({ github, core, ...rest });
+  },
+  evaluateRunCapForPr: async function ({ github: rawGithub, core, ...rest }) {
+    const github = await ensureRateLimitWrapped({ github: rawGithub, core, env: process.env });
+    return evaluateRunCapForPr({ github, core, ...rest });
+  },
 };

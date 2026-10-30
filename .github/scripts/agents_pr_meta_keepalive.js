@@ -1,6 +1,14 @@
 'use strict';
 
+const { getGithubApiCache } = require('./github-api-cache-client');
+const { classifyError, ERROR_CATEGORIES } = require('./error_classifier');
 const { makeTrace } = require('./keepalive_contract.js');
+const { ensureRateLimitWrapped } = require('./github-rate-limited-wrapper.js');
+const {
+  extractIssueNumberFromPull,
+  formatSourceContextForLog,
+  resolvePrSourceContext,
+} = require('./source_context.js');
 
 const DEFAULT_INSTRUCTION_SIGNATURE =
   'keepalive workflow continues nudging until everything is complete';
@@ -12,6 +20,60 @@ const DEFAULT_INSTRUCTION_SIGNATURE =
  */
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// getGithubApiCache is now the single shared factory from
+// github-api-cache-client.js (sentinel __githubApiCache).
+
+async function fetchPullRequestCached({ github, owner, repo, prNumber, core, maxRetries = 3 }) {
+  if (!github?.rest?.pulls?.get || !owner || !repo) {
+    return null;
+  }
+  const number = Number(prNumber);
+  if (!Number.isFinite(number) || number <= 0) {
+    return null;
+  }
+  const cache = getGithubApiCache({ github, core });
+  const key = cache.buildPrCacheKey({ owner, repo, number, resource: 'pulls.get' });
+  return cache.getOrSet({
+    key,
+    fetcher: async () => {
+      let lastError;
+      for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
+        try {
+          const response = await github.rest.pulls.get({ owner, repo, pull_number: number });
+          const data = response?.data;
+          if (!data) {
+            const dataError = new Error('pull request data unavailable');
+            if (response && typeof response === 'object') {
+              dataError.status = response.status;
+            }
+            throw dataError;
+          }
+          return data;
+        } catch (error) {
+          lastError = error;
+          const message = error instanceof Error ? error.message : String(error);
+          if (isTransientError(error) && attempt < maxRetries) {
+            const delayMs = 1000 * Math.pow(2, attempt - 1);
+            if (core?.warning) {
+              core.warning(`PR fetch attempt ${attempt}/${maxRetries} failed (${message}), retrying in ${delayMs}ms...`);
+            }
+            await sleep(delayMs);
+            continue;
+          }
+          if (error && typeof error === 'object') {
+            error.attempts = attempt;
+          }
+          throw error;
+        }
+      }
+      if (lastError && typeof lastError === 'object') {
+        lastError.attempts = maxRetries;
+      }
+      throw lastError || new Error('pull request fetch failed');
+    },
+  });
+}
+
 /**
  * Check if an error is transient and retryable
  * @param {Error} error - The error to check
@@ -19,15 +81,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  */
 function isTransientError(error) {
   if (!error) return false;
-  const status = Number(error?.status || 0);
-  const message = String(error?.message || '').toLowerCase();
-  // Secondary rate limit (429), server errors (5xx) are always retryable
-  if (status === 429 || status >= 500) return true;
-  // 403 is only retryable if message indicates rate limit or abuse detection
-  if (status === 403 && (message.includes('rate limit') || message.includes('abuse detection'))) return true;
-  // Check for rate limit keywords in any error message
-  if (message.includes('rate limit') || message.includes('abuse detection') || message.includes('timeout')) return true;
-  return false;
+  return classifyError(error).category === ERROR_CATEGORIES.transient;
 }
 
 // Inlined from ../../scripts/keepalive_instruction_segment.js to avoid relative require issues in github-script
@@ -37,9 +91,11 @@ function normaliseNewlines(value) {
 
 function findInstructionStart(body) {
   const markers = [
+    /<!--\s*agent-keepalive-round[^>]*-->/i,
     /<!--\s*codex-keepalive-round[^>]*-->/i,
     /<!--\s*keepalive-round[^>]*-->/i,
     /<!--\s*keepalive-attempt[^>]*-->/i,
+    /<!--\s*agent-keepalive-marker\s*-->/i,
     /<!--\s*codex-keepalive-marker\s*-->/i,
   ];
   for (const marker of markers) {
@@ -95,11 +151,23 @@ function computeInstructionByteLength(text) {
   return Buffer.byteLength(String(text || ''), 'utf8');
 }
 
-const AUTOMATION_LOGINS = new Set(['chatgpt-codex-connector', 'stranske-automation-bot']);
+// Automation bot logins — loaded from registry when
+// available, hardcoded fallback otherwise.
+let AUTOMATION_LOGINS;
+try {
+  const { getAllAutomationLogins } =
+    require('./agent_registry.js');
+  AUTOMATION_LOGINS =
+    new Set(getAllAutomationLogins());
+} catch {
+  AUTOMATION_LOGINS = new Set([
+    'chatgpt-codex-connector',
+    'stranske-automation-bot',
+  ]);
+}
 const INSTRUCTION_REACTION = 'hooray';
 // Valid GitHub reactions: +1, -1, laugh, confused, heart, hooray, rocket, eyes
 const LOCK_REACTION = 'rocket';
-
 function normaliseLogin(login) {
   return String(login || '')
     .trim()
@@ -115,49 +183,15 @@ function parseAllowedLogins(env) {
   return new Set(raw);
 }
 
-function extractIssueNumberFromPull(pull) {
-  if (!pull) {
-    return null;
-  }
-
-  const candidates = [];
-
-  const bodyText = pull?.body || '';
-  const metaMatch = bodyText.match(/<!--\s*meta:issue:([0-9]+)\s*-->/i);
-  if (metaMatch) {
-    candidates.push(metaMatch[1]);
-  }
-
-  const branch = pull?.head?.ref || '';
-  // Match issue-XX, issue-#XX, or -issue-#XX patterns (handles Codex verbose branch names)
-  const branchMatch = branch.match(/issue-#?([0-9]+)/i) || branch.match(/-issue-#([0-9]+)(?:$|[^0-9])/i);
-  if (branchMatch) {
-    candidates.push(branchMatch[1]);
-  }
-
-  const title = pull?.title || '';
-  const titleMatch = title.match(/#([0-9]+)/);
-  if (titleMatch) {
-    candidates.push(titleMatch[1]);
-  }
-
-  for (const match of bodyText.matchAll(/#([0-9]+)/g)) {
-    if (match[1]) {
-      candidates.push(match[1]);
-    }
-  }
-
-  for (const value of candidates) {
-    const parsed = Number.parseInt(value, 10);
-    if (!Number.isNaN(parsed)) {
-      return parsed;
-    }
-  }
-
-  return null;
-}
-
 async function detectKeepalive({ core, github, context, env = process.env }) {
+  // Resolve default agent from registry (used for agent_alias output)
+  let _defaultAgent = 'codex';
+  try {
+    const { loadAgentRegistry } = require('./agent_registry.js');
+    const reg = loadAgentRegistry();
+    _defaultAgent = reg.default_agent || 'codex';
+  } catch (_) { /* registry not available */ }
+
   const allowedLogins = parseAllowedLogins(env);
   const keepaliveMarker = env.KEEPALIVE_MARKER || '';
   const toBool = (value) => String(value || '').trim().toLowerCase() === 'true';
@@ -192,15 +226,18 @@ async function detectKeepalive({ core, github, context, env = process.env }) {
   if (keepaliveMarker) {
     canonicalMarkerPatterns.push(new RegExp(escapeRegExp(keepaliveMarker), 'i'));
   }
+  canonicalMarkerPatterns.push(/<!--\s*agent-keepalive-marker\s*-->/i);
   canonicalMarkerPatterns.push(/<!--\s*codex-keepalive-marker\s*-->/i);
   canonicalMarkerPatterns.push(/<!--\s*keepalive-marker\s*-->/i);
 
   const canonicalRoundPatterns = [
+    /<!--\s*agent-keepalive-round\s*:?#?\s*(\d+)\s*-->/i,
     /<!--\s*codex-keepalive-round\s*:?#?\s*(\d+)\s*-->/i,
     /<!--\s*keepalive-round\s*:?#?\s*(\d+)\s*-->/i,
   ];
 
   const canonicalTracePatterns = [
+    /<!--\s*agent-keepalive-trace\s*:?#?\s*([^>]+?)\s*-->/i,
     /<!--\s*codex-keepalive-trace\s*:?#?\s*([^>]+?)\s*-->/i,
     /<!--\s*keepalive-trace\s*:?#?\s*([^>]+?)\s*-->/i,
   ];
@@ -223,6 +260,8 @@ async function detectKeepalive({ core, github, context, env = process.env }) {
     instruction_bytes: '0',
     agent_alias: '',
     head_sha: '',
+    source_type: '',
+    source_ref: '',
   };
 
   const setBasicOutputs = () => {
@@ -247,6 +286,8 @@ async function detectKeepalive({ core, github, context, env = process.env }) {
     core.setOutput('instruction_bytes', outputs.instruction_bytes || '0');
     core.setOutput('agent_alias', outputs.agent_alias || '');
     core.setOutput('head_sha', outputs.head_sha || '');
+    core.setOutput('source_type', outputs.source_type || '');
+    core.setOutput('source_ref', outputs.source_ref || '');
   };
 
   const { comment, issue } = context.payload || {};
@@ -283,7 +324,9 @@ async function detectKeepalive({ core, github, context, env = process.env }) {
       return false;
     }
     const normalised = normaliseBody(value);
-    if (!normalised || !normalised.toLowerCase().startsWith('@codex')) {
+    // @<agent> is the activation trigger pattern
+    const lower = (normalised || '').toLowerCase();
+    if (!lower || !/^@(codex|claude)\b/.test(lower)) {
       return false;
     }
     return normalised.toLowerCase().includes(DEFAULT_INSTRUCTION_SIGNATURE);
@@ -325,7 +368,7 @@ async function detectKeepalive({ core, github, context, env = process.env }) {
     const headSha = outputs.head_sha || (context?.payload?.pull_request?.head?.sha || '').slice(0, 7) || '-';
     const capValue = outputs.cap || 'n/a';
     const activeValue = outputs.active || 'n/a';
-    const dispatchSummary = `DISPATCH: ok=${dispatchOk} path=${dispatchPath} reason=${outputs.reason || 'unknown'} pr=${prValue} activation=${commentId} agent=${outputs.agent_alias || 'codex'} head=${headSha} cap=${capValue} active=${activeValue} trace=${traceValue}`;
+    const dispatchSummary = `DISPATCH: ok=${dispatchOk} path=${dispatchPath} reason=${outputs.reason || 'unknown'} pr=${prValue} activation=${commentId} agent=${outputs.agent_alias || _defaultAgent} head=${headSha} cap=${capValue} active=${activeValue} trace=${traceValue}`;
     core.info(dispatchSummary);
     
     // Also log the INSTRUCTION line for backwards compatibility
@@ -401,17 +444,21 @@ async function detectKeepalive({ core, github, context, env = process.env }) {
   }
 
   // INITIAL ACTIVATION HANDLING:
-  // If no round marker but comment is from an allowed author and starts with @codex,
-  // treat it as initial activation (round 1). This handles the case where a human posts
-  // "@codex <instructions>" without keepalive markers - we bootstrap the first round.
-  // IMPORTANT: Only @codex triggers activation (not any @mention like @maintainer).
+  // If no round marker but comment is from an allowed author and starts with an
+  // agent activation trigger, treat it as initial activation (round 1). This handles
+  // the case where a human posts "@<agent> <instructions>" without keepalive markers.
+  // IMPORTANT: Only known agent triggers activate (not any @mention like @maintainer).
   // Do NOT treat comments that contain the keepalive instruction signature as initial
   // activation - those are manual re-posts of existing instructions and should be rejected.
   const normalisedBody = normaliseBody(body).toLowerCase();
-  const startsWithCodexMention = normalisedBody.startsWith('@codex') &&
-    (normalisedBody.length === 6 || /^@codex[\s,;:!?]/.test(normalisedBody));
-  const isInitialActivation = !roundMatch && isAuthorAllowed && body &&
-    startsWithCodexMention && !isLikelyInstruction(body);
+  const startsWithAgentMention =
+    /^@(codex|claude)([\s,;:!?]|$)/.test(normalisedBody);
+  const hasAgentActivationMarker =
+    normalisedBody.includes('<!-- agent-activation-marker');
+  const isInitialActivation =
+    !roundMatch && isAuthorAllowed && body &&
+    (startsWithAgentMention || hasAgentActivationMarker) &&
+    !isLikelyInstruction(body);
 
   if (!roundMatch && !isInitialActivation) {
     outputs.reason = 'missing-round';
@@ -480,40 +527,25 @@ async function detectKeepalive({ core, github, context, env = process.env }) {
 
   instructionSeen = true;
 
-  // Fetch PR with retry for transient errors (rate limits, server errors)
   let pull;
   const maxRetries = 3;
-  let lastError;
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      const response = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
-      pull = response.data;
-      break;
-    } catch (error) {
-      lastError = error;
-      const message = error instanceof Error ? error.message : String(error);
-      if (isTransientError(error) && attempt < maxRetries) {
-        const delayMs = 1000 * Math.pow(2, attempt - 1); // Exponential backoff: 1s, 2s, 4s
-        core.warning(`PR fetch attempt ${attempt}/${maxRetries} failed (${message}), retrying in ${delayMs}ms...`);
-        await sleep(delayMs);
-        continue;
-      }
-      outputs.reason = 'pull-fetch-failed';
-      core.warning(`Keepalive dispatch skipped: unable to load PR #${prNumber} after ${attempt} attempts (${message}).`);
-      return finalise();
+  try {
+    pull = await fetchPullRequestCached({ github, owner, repo, prNumber, core, maxRetries });
+    if (!pull) {
+      throw new Error('pull request data unavailable');
     }
-  }
-  if (!pull) {
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const attempts = error?.attempts || maxRetries;
     outputs.reason = 'pull-fetch-failed';
-    const message = lastError instanceof Error ? lastError.message : String(lastError || 'unknown error');
-    core.warning(`Keepalive dispatch skipped: unable to load PR #${prNumber} after ${maxRetries} attempts (${message}).`);
+    core.warning(`Keepalive dispatch skipped: unable to load PR #${prNumber} after ${attempts} attempts (${message}).`);
     return finalise();
   }
 
   outputs.branch = pull?.head?.ref || '';
   outputs.base = pull?.base?.ref || '';
   outputs.head_sha = (pull?.head?.sha || '').slice(0, 7);
-  outputs.agent_alias = 'codex'; // Default agent alias
+  outputs.agent_alias = _defaultAgent;
 
   const instructionBody = extractInstructionSegment(body);
   if (!instructionBody) {
@@ -538,9 +570,25 @@ async function detectKeepalive({ core, github, context, env = process.env }) {
     return finalise();
   }
 
-  const issueNumber = extractIssueNumberFromPull(pull);
+  const sourceContext = resolvePrSourceContext(pull);
+  const issueNumber = sourceContext.issueNumber;
   if (issueNumber) {
     outputs.issue = String(issueNumber);
+  }
+  if (sourceContext.isKnown) {
+    outputs.source_type = sourceContext.sourceType;
+  }
+  if (sourceContext.sourceRef) {
+    outputs.source_ref = sourceContext.sourceRef;
+  }
+
+  if (sourceContext.noAutomation) {
+    outputs.reason = 'no-automation-source-context';
+    outputs.dispatch = 'false';
+    core.info(
+      `Keepalive dispatch skipped: PR source context opts out of automation (${formatSourceContextForLog(sourceContext)}).`,
+    );
+    return finalise();
   }
 
   let reactions = [];
@@ -638,9 +686,17 @@ async function detectKeepalive({ core, github, context, env = process.env }) {
   }
 
   if (!issueNumber) {
-    outputs.reason = 'missing-issue-reference';
-    core.info('Keepalive dispatch skipped: unable to determine linked issue number.');
-    return finalise();
+    if (sourceContext.isValid && !sourceContext.requiresIssue) {
+      core.info(
+        `Keepalive dispatch continuing with non-issue workflow source context (${formatSourceContextForLog(sourceContext)}).`,
+      );
+    } else {
+      outputs.reason = 'missing-source-context';
+      core.info(
+        'Keepalive dispatch skipped: unable to determine linked issue number or another valid workflow source context.',
+      );
+      return finalise();
+    }
   }
 
   // Add agents:activated label on first human activation per GoalsAndPlumbing.md Section 1
@@ -667,7 +723,10 @@ async function detectKeepalive({ core, github, context, env = process.env }) {
 }
 
 module.exports = {
-  detectKeepalive,
+  detectKeepalive: async function ({ core, github: rawGithub, context, env = process.env }) {
+    const github = await ensureRateLimitWrapped({ github: rawGithub, core, env });
+    return detectKeepalive({ core, github, context, env });
+  },
   normaliseLogin,
   parseAllowedLogins,
   extractIssueNumberFromPull,

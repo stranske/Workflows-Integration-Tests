@@ -1,9 +1,25 @@
 'use strict';
 
+const { ensureRateLimitWrapped } = require('./github-rate-limited-wrapper.js');
+const { readAuthorityState, requester } = require('./keepalive_authority_state.js');
+
 const STATE_MARKER = 'keepalive-state';
 const STATE_VERSION = 'v1';
 const STATE_REGEX = /<!--\s*keepalive-state(?::([\w.-]+))?\s+(.*?)\s*-->/s;
 const LOG_PREFIX = '[keepalive_state]';
+const TRUSTED_KEEPALIVE_STATE_AUTHORS = new Set([
+  'stranske-keepalive[bot]',
+  'agents-workflows-bot[bot]',
+  // Migration-only compatibility for summaries created before dedicated App
+  // tokens became mandatory. New workflows do not write state with this bot.
+  'github-actions[bot]',
+]);
+const TRUSTED_KEEPALIVE_STATE_PAT_AUTHORS = new Set([
+  // reusable-70-orchestrator-init.yml probes and enforces these exact
+  // identities before ACTIONS_BOT_PAT or SERVICE_BOT_PAT may write state.
+  'stranske',
+  'stranske-automation-bot',
+]);
 
 function logInfo(message) {
   console.info(`${LOG_PREFIX} ${message}`);
@@ -15,6 +31,13 @@ function normalise(value) {
 
 function normaliseLower(value) {
   return normalise(value).toLowerCase();
+}
+
+function isTrustedKeepaliveStateComment(comment) {
+  const type = normaliseLower(comment?.user?.type);
+  const login = normaliseLower(comment?.user?.login);
+  return (type === 'bot' && TRUSTED_KEEPALIVE_STATE_AUTHORS.has(login))
+    || (type === 'user' && TRUSTED_KEEPALIVE_STATE_PAT_AUTHORS.has(login));
 }
 
 function deepMerge(target, source) {
@@ -136,6 +159,56 @@ function parseStateComment(body) {
   return { version, data: {} };
 }
 
+function hasFiniteNumericValue(value) {
+  if (value === null || value === undefined) {
+    return false;
+  }
+  if (typeof value === 'string' && value.trim() === '') {
+    return false;
+  }
+  return Number.isFinite(Number(value));
+}
+
+function isLoopState(data) {
+  if (!data || typeof data !== 'object') {
+    return false;
+  }
+  if (hasFiniteNumericValue(data.iteration) || hasFiniteNumericValue(data.max_iterations)) {
+    return true;
+  }
+  if (data.tasks && typeof data.tasks === 'object') {
+    if (hasFiniteNumericValue(data.tasks.total) || hasFiniteNumericValue(data.tasks.unchecked)) {
+      return true;
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(data, 'keepalive_enabled')) {
+    return true;
+  }
+  if (Object.prototype.hasOwnProperty.call(data, 'autofix_enabled')) {
+    return true;
+  }
+  if (Object.prototype.hasOwnProperty.call(data, 'running')) {
+    return true;
+  }
+  if (data.verification && typeof data.verification === 'object') {
+    return true;
+  }
+  if (data.last_instruction && typeof data.last_instruction === 'object') {
+    return true;
+  }
+  // Delegation state fields (agent:auto mode)
+  if (data.current_agent && typeof data.current_agent === 'string') {
+    return true;
+  }
+  if (Array.isArray(data.delegation_log) && data.delegation_log.length > 0) {
+    return true;
+  }
+  if (Array.isArray(data.effectiveness_history) && data.effectiveness_history.length > 0) {
+    return true;
+  }
+  return false;
+}
+
 function formatStateComment(data) {
   const payload = data && typeof data === 'object' ? { ...data } : {};
   const version = normalise(payload.version) || STATE_VERSION;
@@ -186,8 +259,12 @@ async function findStateComment({ github, owner, repo, prNumber, trace }) {
     return null;
   }
   const traceNorm = normaliseLower(trace);
+  let fallback = null;
   for (let index = comments.length - 1; index >= 0; index -= 1) {
     const comment = comments[index];
+    if (!isTrustedKeepaliveStateComment(comment)) {
+      continue;
+    }
     const parsed = parseStateComment(comment?.body);
     if (!parsed) {
       continue;
@@ -198,6 +275,15 @@ async function findStateComment({ github, owner, repo, prNumber, trace }) {
       if (candidateTrace !== traceNorm) {
         continue;
       }
+    } else if (!isLoopState(candidate)) {
+      if (!fallback) {
+        fallback = {
+          comment,
+          state: candidate,
+          version: parsed.version,
+        };
+      }
+      continue;
     }
     return {
       comment,
@@ -205,10 +291,19 @@ async function findStateComment({ github, owner, repo, prNumber, trace }) {
       version: parsed.version,
     };
   }
-  return null;
+  return fallback;
 }
 
-async function createKeepaliveStateManager({ github, context, prNumber, trace, round }) {
+async function createKeepaliveStateManager({ github: rawGithub, context, prNumber, trace, round }) {
+  // Wrap github client with rate-limit-aware retry
+  let github;
+  try {
+    github = await ensureRateLimitWrapped({ github: rawGithub, env: process.env });
+  } catch (error) {
+    console.warn(`Failed to wrap GitHub client: ${error.message} - using raw client`);
+    github = rawGithub;
+  }
+
   const owner = context?.repo?.owner;
   const repo = context?.repo?.repo;
   if (!owner || !repo || !Number.isFinite(prNumber) || prNumber <= 0) {
@@ -297,12 +392,30 @@ async function createKeepaliveStateManager({ github, context, prNumber, trace, r
   };
 }
 
-async function saveKeepaliveState({ github, context, prNumber, trace, round, updates }) {
+async function saveKeepaliveState({ github: rawGithub, context, prNumber, trace, round, updates }) {
+  // Wrap github client with rate-limit-aware retry
+  let github;
+  try {
+    github = await ensureRateLimitWrapped({ github: rawGithub, env: process.env });
+  } catch (error) {
+    console.warn(`Failed to wrap GitHub client: ${error.message} - using raw client`);
+    github = rawGithub;
+  }
+
   const manager = await createKeepaliveStateManager({ github, context, prNumber, trace, round });
   return manager.save(updates);
 }
 
-async function loadKeepaliveState({ github, context, prNumber, trace }) {
+async function loadKeepaliveState({ github: rawGithub, context, prNumber, trace }) {
+  // Wrap github client with rate-limit-aware retry
+  let github;
+  try {
+    github = await ensureRateLimitWrapped({ github: rawGithub, env: process.env });
+  } catch (error) {
+    console.warn(`Failed to wrap GitHub client: ${error.message} - using raw client`);
+    github = rawGithub;
+  }
+
   const owner = context?.repo?.owner;
   const repo = context?.repo?.repo;
   if (!owner || !repo || !Number.isFinite(prNumber) || prNumber <= 0) {
@@ -318,10 +431,154 @@ async function loadKeepaliveState({ github, context, prNumber, trace }) {
     state: loadedState,
     commentId: existing.comment?.id ? Number(existing.comment.id) : 0,
     commentUrl: existing.comment?.html_url || '',
+    commentAuthorLogin: existing.comment?.user?.login || '',
+    commentAuthorType: existing.comment?.user?.type || '',
   };
 }
 
-async function resetState({ github, context, prNumber, trace, round }) {
+function summaryMatchesRecoveredAuthority(state, priorGenerations, recoveredAttempt) {
+  if (state?.attention && priorGenerations.has(state.attention.generation)) {
+    if (state.running === true) {
+      return Boolean(recoveredAttempt) && state.running_owner_attempt === recoveredAttempt;
+    }
+    return !state.running_owner_attempt || state.running_owner_attempt === recoveredAttempt;
+  }
+  const attention = state?.attention || {};
+  return state?.running === false &&
+    attention.owner === 'automation' &&
+    attention.disposition === 'automation-retry' &&
+    !attention.generation &&
+    !attention.boundary_fingerprint &&
+    !attention.challenge_due_at &&
+    !attention.expires_at &&
+    recoveredAttempt &&
+    attention.recovery_owner_attempt === recoveredAttempt &&
+    priorGenerations.has(attention.recovery_generation);
+}
+
+const RECOVERY_RECEIPT_FIELDS = ['id', 'owner_attempt', 'claim_digest', 'head_sha', 'provider'];
+
+function sameRecoveryReceipt(left, right) {
+  return Boolean(left && right) &&
+    RECOVERY_RECEIPT_FIELDS.every((field) => left[field] === right[field]);
+}
+
+function currentSettledRecovery(recovery, current) {
+  const receiptField = recovery.status === 'released' ? 'released_receipt' : 'recovered_receipt';
+  if (current?.status !== 'available' ||
+      current.head_sha !== recovery.state.head_sha ||
+      current.boundary_fingerprint !== recovery.state.boundary_fingerprint ||
+      !sameRecoveryReceipt(current[receiptField], recovery.state[receiptField])) {
+    return null;
+  }
+  return current;
+}
+
+async function projectRecoveredAuthorityState({
+  github, context, prNumber, recovery, writerLogin,
+  readAuthority = readAuthorityState, makeRequest = requester,
+}) {
+  if (!['released', 'reopened'].includes(recovery?.status) || !recovery.state) {
+    throw new Error('No settled authority recovery to project');
+  }
+  const repository = `${context.repo.owner}/${context.repo.repo}`;
+  const firstAuthorityRead = await readAuthority(makeRequest(github), repository, prNumber);
+  let currentRecovery = currentSettledRecovery(recovery, firstAuthorityRead?.state);
+  if (!currentRecovery) {
+    return { projected: false, reason: 'recovery-superseded' };
+  }
+  const currentGenerationLineage = recovery.status === 'released'
+    ? (currentRecovery.released_generation_lineage || [])
+    : (currentRecovery.recovered_generation_lineage || []);
+  const priorGenerations = new Set([
+    recovery.previousGeneration || recovery.state.generation,
+    ...(recovery.previousGenerations || []),
+    recovery.state.generation,
+    currentRecovery.generation,
+    ...currentGenerationLineage,
+  ]);
+  const recoveredAttempt = (recovery.status === 'released' ? recovery.state.released_receipt :
+    recovery.state.recovered_receipt)?.owner_attempt || '';
+  const loaded = await loadKeepaliveState({ github, context, prNumber, trace: '' });
+  let state = loaded.state;
+  if (state?.running === false && recoveredAttempt &&
+      state?.attention?.recovery_owner_attempt === recoveredAttempt &&
+      state.attention.generation === currentRecovery.generation) {
+    return { projected: true, reason: 'already-projected' };
+  }
+  if (!summaryMatchesRecoveredAuthority(state, priorGenerations, recoveredAttempt)) {
+    throw new Error('Trusted summary does not match the recovered generation');
+  }
+  const sameWriter = loaded.commentId &&
+    String(loaded.commentAuthorLogin || '').toLowerCase() === String(writerLogin || '').toLowerCase();
+  if (sameWriter) {
+    const response = await github.rest.issues.getComment({
+      owner: context.repo.owner, repo: context.repo.repo, comment_id: loaded.commentId,
+    });
+    const latest = parseStateComment(response?.data?.body)?.data;
+    if (!summaryMatchesRecoveredAuthority(latest, priorGenerations, recoveredAttempt)) {
+      if (latest?.attention?.generation === currentRecovery.generation && latest.running === false &&
+          latest.attention.recovery_owner_attempt === recoveredAttempt) {
+        return { projected: true, reason: 'already-projected' };
+      }
+      throw new Error('Trusted summary changed during authority projection');
+    }
+    state = latest;
+  }
+  const finalAuthorityRead = await readAuthority(makeRequest(github), repository, prNumber);
+  currentRecovery = currentSettledRecovery(recovery, finalAuthorityRead?.state);
+  if (!currentRecovery || (firstAuthorityRead?.sha && finalAuthorityRead?.sha !== firstAuthorityRead.sha)) {
+    return { projected: false, reason: 'recovery-superseded' };
+  }
+  const { recovery_generation: _recoveryGeneration, ...priorAttention } = state.attention;
+  const projected = {
+    ...state,
+    running: false,
+    running_since: null,
+    running_owner_attempt: null,
+    attention: {
+      ...priorAttention,
+      owner: 'automation', disposition: 'challenge-due',
+      generation: currentRecovery.generation,
+      recovery_owner_attempt: recoveredAttempt,
+      boundary_fingerprint: currentRecovery.boundary_fingerprint,
+      challenge_due_at: currentRecovery.due_at,
+      expires_at: currentRecovery.expires_at,
+      next_action: 'Retry the exact-head authority challenge through the owning sweep.',
+    },
+  };
+  const body = [
+    '<!-- keepalive-loop-summary -->',
+    '## Keepalive Loop Status',
+    '',
+    'The failed originating run did not start a worker; its authority receipt was reconciled.',
+    '',
+    formatStateComment(projected),
+  ].join('\n');
+  if (sameWriter) {
+    await github.rest.issues.updateComment({
+      owner: context.repo.owner, repo: context.repo.repo,
+      comment_id: loaded.commentId, body,
+    });
+  } else {
+    await github.rest.issues.createComment({
+      owner: context.repo.owner, repo: context.repo.repo,
+      issue_number: prNumber, body,
+    });
+  }
+  return { projected: true, reason: 'recovered-summary-projected' };
+}
+
+async function resetState({ github: rawGithub, context, prNumber, trace, round }) {
+  // Wrap github client with rate-limit-aware retry
+  let github;
+  try {
+    github = await ensureRateLimitWrapped({ github: rawGithub, env: process.env });
+  } catch (error) {
+    console.warn(`Failed to wrap GitHub client: ${error.message} - using raw client`);
+    github = rawGithub;
+  }
+
   const startTime = Date.now();
   const timestamp = new Date(startTime).toISOString();
   const issueNumber = Number.isFinite(prNumber) ? String(prNumber) : normalise(prNumber);
@@ -404,6 +661,7 @@ async function resetState({ github, context, prNumber, trace, round }) {
 }
 
 module.exports = {
+  projectRecoveredAuthorityState,
   createKeepaliveStateManager,
   saveKeepaliveState,
   loadKeepaliveState,
@@ -414,4 +672,5 @@ module.exports = {
   upsertStateCommentBody,
   deepMerge,
   formatTimestamp,
+  isTrustedKeepaliveStateComment,
 };

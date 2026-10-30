@@ -1,8 +1,18 @@
 'use strict';
 
+const { ensureRateLimitWrapped } = require('./github-rate-limited-wrapper.js');
+const { classifyError, ERROR_CATEGORIES } = require('./error_classifier');
+
+// Resolve default agent from registry
+let _defaultAgent = 'codex';
+try {
+  const { loadAgentRegistry } = require('./agent_registry.js');
+  _defaultAgent = loadAgentRegistry().default_agent || 'codex';
+} catch (_) { /* registry not available */ }
+
 /**
  * agents_pr_meta_orchestrator.js
- * 
+ *
  * External script for keepalive orchestrator functionality in agents-pr-meta workflow.
  * Handles token selection, activation locks, snapshot runs, dispatch, and confirmation.
  */
@@ -16,15 +26,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  */
 function isTransientError(error) {
   if (!error) return false;
-  const status = Number(error?.status || 0);
-  const message = String(error?.message || '').toLowerCase();
-  // Secondary rate limit (429), server errors (5xx) are always retryable
-  if (status === 429 || status >= 500) return true;
-  // 403 is only retryable if message indicates rate limit or abuse detection
-  if (status === 403 && (message.includes('rate limit') || message.includes('abuse detection'))) return true;
-  // Check for rate limit keywords in any error message
-  if (message.includes('rate limit') || message.includes('abuse detection') || message.includes('timeout')) return true;
-  return false;
+  return classifyError(error).category === ERROR_CATEGORIES.transient;
 }
 
 /**
@@ -268,7 +270,7 @@ async function confirmDispatch({github, context, core, baselineIds, baselineTime
 }
 
 /**
- * Dispatch codex keepalive command via repository_dispatch
+ * Dispatch agent keepalive command via repository_dispatch
  */
 async function dispatchKeepaliveCommand({github, context, core, inputs}) {
   const { prNumber, base, head, round, trace, commentId, commentUrl, agentAlias, instructionBody } = inputs;
@@ -307,7 +309,7 @@ async function dispatchKeepaliveCommand({github, context, core, inputs}) {
     issue: prNumber,
     base: resolvedBase,
     head: resolvedHead,
-    agent: agentAlias || 'codex',
+    agent: agentAlias || _defaultAgent,
     instruction_body: instructionBody,
     meta: {
       comment_id: commentId,
@@ -327,6 +329,7 @@ async function dispatchKeepaliveCommand({github, context, core, inputs}) {
       await github.rest.repos.createDispatchEvent({
         owner,
         repo,
+        // API contract: event type matched by dispatch handlers in consumers
         event_type: 'codex-pr-comment-command',
         client_payload: clientPayload,
       });
@@ -448,10 +451,28 @@ async function runKeepaliveOrchestrator({github, context, core, inputs, secrets}
 }
 
 module.exports = {
-  acquireActivationLock,
-  snapshotOrchestratorRuns,
-  dispatchOrchestrator,
-  confirmDispatch,
-  dispatchKeepaliveCommand,
-  runKeepaliveOrchestrator,
+  acquireActivationLock: async function ({github: rawGithub, context, core, commentId}) {
+    const github = await ensureRateLimitWrapped({ github: rawGithub, core, env: process.env });
+    return acquireActivationLock({github, context, core, commentId});
+  },
+  snapshotOrchestratorRuns: async function ({github: rawGithub, context, core, prNumber, trace}) {
+    const github = await ensureRateLimitWrapped({ github: rawGithub, core, env: process.env });
+    return snapshotOrchestratorRuns({github, context, core, prNumber, trace});
+  },
+  dispatchOrchestrator: async function ({github: rawGithub, context, core, inputs}) {
+    const github = await ensureRateLimitWrapped({ github: rawGithub, core, env: process.env });
+    return dispatchOrchestrator({github, context, core, inputs});
+  },
+  confirmDispatch: async function ({github: rawGithub, context, core, baselineIds, baselineTimestamp, prNumber, trace}) {
+    const github = await ensureRateLimitWrapped({ github: rawGithub, core, env: process.env });
+    return confirmDispatch({github, context, core, baselineIds, baselineTimestamp, prNumber, trace});
+  },
+  dispatchKeepaliveCommand: async function ({github: rawGithub, context, core, inputs}) {
+    const github = await ensureRateLimitWrapped({ github: rawGithub, core, env: process.env });
+    return dispatchKeepaliveCommand({github, context, core, inputs});
+  },
+  runKeepaliveOrchestrator: async function ({github: rawGithub, context, core, inputs, secrets}) {
+    const github = await ensureRateLimitWrapped({ github: rawGithub, core, env: process.env });
+    return runKeepaliveOrchestrator({github, context, core, inputs, secrets});
+  },
 };

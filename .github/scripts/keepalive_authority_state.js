@@ -1,0 +1,1341 @@
+'use strict';
+
+// This branch is the authority for challenge generations and receipts. PR comments
+// are presentation only: a comment PATCH cannot provide a conditional write.
+const crypto = require('node:crypto');
+const { createGithubFetchRequester, withRetry } = require('./github-api-with-retry.js');
+const BRANCH = 'keepalive-authority-state';
+const HEX = /^[0-9a-f]{64}$/;
+const HEAD = /^[0-9a-f]{40}$/;
+const ATTEMPT = /^[a-z0-9_.-]+\/[a-z0-9_.-]+:\d+:\d+$/;
+const RECOVERED_LINEAGE_LIMIT = 16;
+
+function exactTime(value) {
+  if (typeof value !== 'string' || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(value)) return false;
+  return Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value;
+}
+
+function validState(state, repository, prNumber, { allowLegacyHead = false } = {}) {
+  return state && state.version === 2 &&
+    state.repository === String(repository).toLowerCase() &&
+    state.pr_number === Number(prNumber) &&
+    HEX.test(state.generation) && HEX.test(state.boundary_fingerprint) &&
+    exactTime(state.due_at) && exactTime(state.expires_at) &&
+    Date.parse(state.expires_at) > Date.parse(state.due_at) &&
+    (HEAD.test(state.head_sha) || (allowLegacyHead && state.head_sha === undefined)) &&
+    Number.isSafeInteger(state.revision) && state.revision >= 1 &&
+    ['available', 'prepared', 'consumed', 'confirmed'].includes(state.status) &&
+    (state.released_generation == null || HEX.test(state.released_generation)) &&
+    (state.released_generation_lineage == null ||
+      (Array.isArray(state.released_generation_lineage) &&
+        state.released_generation_lineage.every((generation) => HEX.test(generation)))) &&
+    (state.recovered_generation == null || HEX.test(state.recovered_generation)) &&
+    (state.recovered_generation_lineage == null ||
+      (Array.isArray(state.recovered_generation_lineage) &&
+        state.recovered_generation_lineage.length <= RECOVERED_LINEAGE_LIMIT &&
+        state.recovered_generation_lineage.every((generation) => HEX.test(generation)))) &&
+    (state.released_receipt == null ||
+      (validReceipt(state.released_receipt, repository) && HEX.test(state.released_generation))) &&
+    (state.recovered_receipt == null ||
+      (validReceipt(state.recovered_receipt, repository) && HEX.test(state.recovered_generation))) &&
+    (state.status === 'available' ? state.receipt === null :
+      validReceipt(state.receipt, repository));
+}
+
+function validOwnerAttempt(repository, ownerAttempt) {
+  const repo = String(repository).toLowerCase();
+  if (typeof ownerAttempt !== 'string' || ownerAttempt !== ownerAttempt.toLowerCase() ||
+      !ATTEMPT.test(ownerAttempt) || !ownerAttempt.startsWith(`${repo}:`)) return false;
+  const identity = ownerAttempt.slice(repo.length + 1).match(/^([1-9]\d*):([1-9]\d*)$/);
+  if (!identity) return false;
+  return identity.slice(1).every((value) => Number.isSafeInteger(Number(value)));
+}
+
+function validReceipt(receipt, repository) {
+  return receipt && typeof receipt === 'object' && !Array.isArray(receipt) &&
+    HEX.test(receipt.id) && HEX.test(receipt.claim_digest) &&
+    validOwnerAttempt(repository, receipt.owner_attempt) && HEAD.test(receipt.head_sha) &&
+    typeof receipt.provider === 'string' && /^[a-z][a-z0-9_-]*$/.test(receipt.provider) &&
+    exactTime(receipt.consumed_at);
+}
+
+function pathFor(repository, prNumber) {
+  if (!/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/i.test(String(repository)) ||
+      !Number.isSafeInteger(Number(prNumber)) || Number(prNumber) < 1) {
+    throw new Error('Invalid challenge repository or PR number');
+  }
+  return `/repos/${String(repository).toLowerCase()}/contents/.github/keepalive-authority/${Number(prNumber)}.json`;
+}
+
+function attemptPath(repository, ownerAttempt) {
+  if (!ATTEMPT.test(String(ownerAttempt)) ||
+      !String(ownerAttempt).startsWith(`${String(repository).toLowerCase()}:`)) {
+    throw new Error('Invalid authority attempt repository');
+  }
+  const key = crypto.createHash('sha256').update(ownerAttempt).digest('hex');
+  return `/repos/${String(repository).toLowerCase()}/contents/.github/keepalive-authority-attempts/${key}.json`;
+}
+
+function presencePath(repository, indexTreeSha) {
+  if (!HEAD.test(String(indexTreeSha))) throw new Error('Invalid authority attempt tree SHA');
+  return `/repos/${String(repository).toLowerCase()}/contents/.github/keepalive-authority-presence-v2/${indexTreeSha}.json`;
+}
+
+function checkpointPath(repository) {
+  return `/repos/${repository}/contents/.github/keepalive-authority-presence-v2/checkpoint.json`;
+}
+
+function bootstrapPresencePath(repository) {
+  return `/repos/${repository}/contents/.github/keepalive-authority-presence-v2/bootstrap.json`;
+}
+
+function validAttemptIndex(index, repository, ownerAttempt) {
+  return index?.version === 1 && index.repository === String(repository).toLowerCase() &&
+    index.owner_attempt === ownerAttempt && Number.isSafeInteger(index.pr_number) &&
+    index.pr_number > 0 && HEX.test(index.generation) &&
+    validReceipt(index.receipt, repository) &&
+    index.receipt.owner_attempt === ownerAttempt;
+}
+
+async function readAttemptIndex(request, repository, ownerAttempt, { allowMissing = false } = {}) {
+  let file;
+  try {
+    file = await request('GET', `${attemptPath(repository, ownerAttempt)}?ref=${BRANCH}`);
+  } catch (error) {
+    if (allowMissing && error.status === 404) return null;
+    throw error;
+  }
+  if (!/^[0-9a-f]{40}$/.test(String(file?.sha)) || file?.encoding !== 'base64') {
+    throw new Error('Invalid authority attempt index metadata');
+  }
+  let index;
+  try {
+    index = JSON.parse(Buffer.from(String(file.content).replace(/\s/g, ''), 'base64').toString('utf8'));
+  } catch (error) {
+    throw new Error(`Malformed authority attempt index: ${error.message}`);
+  }
+  if (!validAttemptIndex(index, repository, ownerAttempt)) {
+    throw new Error('Invalid authority attempt index');
+  }
+  return index;
+}
+
+async function createAttemptIndex(request, repository, ownerAttempt, index) {
+  const existing = await readAttemptIndex(request, repository, ownerAttempt, { allowMissing: true });
+  if (existing) return existing;
+  try {
+    await request('PUT', attemptPath(repository, ownerAttempt), {
+      branch: BRANCH,
+      message: `keepalive authority attempt ${ownerAttempt}`,
+      content: Buffer.from(`${JSON.stringify(index)}\n`).toString('base64'),
+    });
+    return index;
+  } catch (error) {
+    if (![409, 422].includes(error.status)) throw error;
+    return readAttemptIndex(request, repository, ownerAttempt);
+  }
+}
+
+async function requestWithOctokit(github, method, path, body) {
+  try {
+    // Writes are conditional and intentionally get no automatic retry. An
+    // uncertain result must deny the grant even if GitHub committed the write.
+    const response = await withRetry(
+      (client) => client.request(`${method} ${path}`, body || {}),
+      { github, maxRetries: method === 'GET' ? 2 : 0,
+        tokenRegistry: null, task: 'keepalive-authority-state' },
+    );
+    return response.data;
+  } catch (error) {
+    error.status = error.status || error.response?.status;
+    throw error;
+  }
+}
+
+function requester(github) {
+  if (github) {
+    return (method, path, body) => requestWithOctokit(github, method, path, body);
+  }
+  const token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
+  if (!token) throw new Error('Authority state token unavailable');
+  try {
+    const { Octokit } = require('@octokit/rest');
+    const octokit = new Octokit({ auth: token });
+    return (method, path, body) => requestWithOctokit(octokit, method, path, body);
+  } catch {
+    return createGithubFetchRequester({ token });
+  }
+}
+
+async function ensureBranch(request, repository, defaultBranch) {
+  const repo = String(repository).toLowerCase();
+  try {
+    await request('GET', `/repos/${repo}/git/ref/heads/${BRANCH}`);
+    return;
+  } catch (error) {
+    if (error.status !== 404) throw error;
+  }
+  const base = await request('GET', `/repos/${repo}/git/ref/heads/${encodeURIComponent(defaultBranch)}`);
+  const sha = base?.object?.sha;
+  if (!/^[0-9a-f]{40}$/.test(String(sha))) throw new Error('Default branch SHA unavailable');
+  try {
+    await request('POST', `/repos/${repo}/git/refs`, { ref: `refs/heads/${BRANCH}`, sha });
+  } catch (error) {
+    // Another PR may have initialized the shared branch concurrently.
+    if (![409, 422].includes(error.status)) throw error;
+    await request('GET', `/repos/${repo}/git/ref/heads/${BRANCH}`);
+  }
+}
+
+async function readAuthorityState(request, repository, prNumber, { allowMissing = false } = {}) {
+  let file;
+  try {
+    file = await request('GET', `${pathFor(repository, prNumber)}?ref=${BRANCH}`);
+  } catch (error) {
+    if (allowMissing && error.status === 404) return null;
+    throw error;
+  }
+  let state;
+  try {
+    if (!/^[0-9a-f]{40}$/.test(String(file?.sha)) || file?.encoding !== 'base64') {
+      throw new Error('Invalid authority file metadata');
+    }
+    state = JSON.parse(Buffer.from(String(file.content).replace(/\s/g, ''), 'base64').toString('utf8'));
+  } catch (error) {
+    throw new Error(`Malformed authoritative challenge state: ${error.message}`);
+  }
+  if (!validState(state, repository, prNumber, { allowLegacyHead: true })) {
+    throw new Error('Invalid authoritative challenge state');
+  }
+  return { state, sha: file.sha };
+}
+
+function decodeAuthorityBlob(file, repository, prNumber) {
+  if (!/^[0-9a-f]{40}$/.test(String(file?.sha)) || file?.encoding !== 'base64') {
+    throw new Error('Invalid authority blob metadata');
+  }
+  const encoded = String(file.content || '').replace(/\s/g, '');
+  const canonicalBase64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+  if (!encoded || !canonicalBase64.test(encoded) ||
+      Buffer.from(encoded, 'base64').toString('base64') !== encoded) {
+    throw new Error('Malformed authoritative challenge state: non-canonical base64');
+  }
+  let state;
+  try {
+    state = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
+  } catch (error) {
+    throw new Error(`Malformed authoritative challenge state: ${error.message}`);
+  }
+  if (!validState(state, repository, prNumber, { allowLegacyHead: true })) {
+    throw new Error('Invalid authoritative challenge state');
+  }
+  return { state, sha: file.sha };
+}
+
+async function readAuthorityStateForReplay(request, repository, prNumber) {
+  const repo = String(repository).toLowerCase();
+  const number = Number(prNumber);
+  pathFor(repo, number);
+
+  const ref = await request('GET', `/repos/${repo}/git/ref/heads/${BRANCH}`);
+  const commitSha = ref?.object?.sha;
+  if (ref?.object?.type !== 'commit' || !/^[0-9a-f]{40}$/.test(String(commitSha))) {
+    throw new Error(`Authority branch ${BRANCH} did not resolve to a commit`);
+  }
+  const commit = await request('GET', `/repos/${repo}/git/commits/${commitSha}`);
+  let treeSha = commit?.tree?.sha;
+  if (!/^[0-9a-f]{40}$/.test(String(treeSha))) {
+    throw new Error(`Authority commit ${commitSha} has no valid root tree`);
+  }
+
+  const segments = ['.github', 'keepalive-authority', `${number}.json`];
+  for (let index = 0; index < segments.length; index += 1) {
+    const tree = await request('GET', `/repos/${repo}/git/trees/${treeSha}`);
+    if (tree?.truncated !== false || !Array.isArray(tree?.tree)) {
+      throw new Error(`Authority tree ${treeSha} is incomplete or malformed`);
+    }
+    if (!tree.tree.every((item) => item && typeof item === 'object' &&
+      typeof item.path === 'string' && item.path.length > 0 && !item.path.includes('/') &&
+      ['blob', 'tree', 'commit'].includes(item.type) &&
+      /^[0-9a-f]{40}$/.test(String(item.sha)))) {
+      throw new Error(`Authority tree ${treeSha} contains an invalid entry`);
+    }
+    const entry = tree.tree.find((item) => item?.path === segments[index]);
+    // An exact, complete tree snapshot is the only safe proof that no ledger exists.
+    if (!entry) return null;
+    const finalSegment = index === segments.length - 1;
+    const expectedType = finalSegment ? 'blob' : 'tree';
+    if (entry.type !== expectedType || !/^[0-9a-f]{40}$/.test(String(entry.sha))) {
+      throw new Error(
+        `Authority path ${segments.slice(0, index + 1).join('/')} is not a valid ${expectedType}`,
+      );
+    }
+    treeSha = entry.sha;
+  }
+
+  const blob = await request('GET', `/repos/${repo}/git/blobs/${treeSha}`);
+  if (blob?.sha !== treeSha) {
+    throw new Error(`Authority blob ${treeSha} did not match the pinned tree entry`);
+  }
+  return decodeAuthorityBlob(blob, repo, number);
+}
+
+async function writeAuthorityState(request, repository, prNumber, state, priorSha) {
+  if (!validState(state, repository, prNumber)) throw new Error('Refusing invalid authoritative challenge state');
+  const body = {
+    branch: BRANCH,
+    message: `keepalive authority PR #${Number(prNumber)} revision ${state.revision}`,
+    content: Buffer.from(`${JSON.stringify(state)}\n`).toString('base64'),
+    ...(priorSha ? { sha: priorSha } : {}),
+  };
+  return request('PUT', pathFor(repository, prNumber), body);
+}
+
+function expectedGenerationMatches(state, expectedGeneration, headSha) {
+  if (!expectedGeneration) return true;
+  if (state?.generation === expectedGeneration) return true;
+  return state?.status === 'available' && state.receipt === null &&
+    state.head_sha === headSha && (
+      (state.released_receipt &&
+        (state.released_generation === expectedGeneration ||
+          state.released_generation_lineage?.includes(expectedGeneration))) ||
+      (state.recovered_receipt &&
+        (state.recovered_generation === expectedGeneration ||
+          state.recovered_generation_lineage?.includes(expectedGeneration)))
+    );
+}
+
+function preparedAttemptMatchesIndex(state, index, repository, prNumber) {
+  const receipt = state?.receipt;
+  const claim = state?.prepared_claim;
+  return state?.status === 'prepared' && claim && receipt &&
+    claim.generation === state.generation &&
+    claim.boundary_fingerprint === state.boundary_fingerprint &&
+    claim.due_at === state.due_at && claim.expires_at === state.expires_at &&
+    claim.head_sha === state.head_sha &&
+    receiptMatches(receipt, claim, receipt.owner_attempt, receipt.provider, state.head_sha) &&
+    index.repository === String(repository).toLowerCase() &&
+    index.pr_number === Number(prNumber) && index.owner_attempt === receipt.owner_attempt &&
+    index.generation === state.generation && index.receipt.id === receipt.id &&
+    index.receipt.claim_digest === receipt.claim_digest &&
+    index.receipt.provider === receipt.provider && index.receipt.head_sha === state.head_sha;
+}
+
+function legacyPreparedAttemptMatchesIndex(state, index, repository, prNumber) {
+  const receipt = state?.receipt;
+  const ownerAttempt = receipt?.owner_attempt;
+  return state?.status === 'prepared' && state.prepared_claim === undefined &&
+    validReceipt(receipt, repository) && receipt.head_sha === state.head_sha &&
+    ownerAttempt.startsWith(`${String(repository).toLowerCase()}:`) &&
+    index.repository === String(repository).toLowerCase() &&
+    index.pr_number === Number(prNumber) && index.owner_attempt === ownerAttempt &&
+    index.generation === state.generation && sameReceipt(index.receipt, receipt);
+}
+
+function sameReceipt(left, right) {
+  return Boolean(left && right) &&
+    ['id', 'claim_digest', 'owner_attempt', 'provider', 'head_sha', 'consumed_at']
+      .every((field) => left[field] === right[field]);
+}
+
+function recoveredAttemptMatchesIndex(state, index, repository, prNumber, ownerAttempt) {
+  return state?.status === 'available' && state.receipt === null &&
+    validReceipt(state.recovered_receipt, repository) && HEX.test(state.recovered_generation) &&
+    index.repository === String(repository).toLowerCase() &&
+    index.pr_number === Number(prNumber) && index.owner_attempt === ownerAttempt &&
+    index.generation === state.recovered_generation &&
+    sameReceipt(index.receipt, state.recovered_receipt) &&
+    state.recovered_receipt.owner_attempt === ownerAttempt &&
+    state.recovered_receipt.head_sha === state.head_sha;
+}
+
+function nextRecoveredLineage(state) {
+  const original = state.recovered_generation || state.generation;
+  const unique = [...new Set([
+    ...(state.recovered_generation_lineage || []),
+    original,
+    state.generation,
+  ])];
+  const recent = unique.filter((generation) => generation !== original)
+    .slice(-(RECOVERED_LINEAGE_LIMIT - 1));
+  return [original, ...recent];
+}
+
+async function recoverExpiredLegacyPreparation({ request, repository, prNumber, prior, now }) {
+  const state = prior.state;
+  if (state.status !== 'prepared' || state.prepared_claim !== undefined ||
+      now.getTime() < Date.parse(state.expires_at) ||
+      state.receipt?.head_sha !== state.head_sha ||
+      !state.receipt?.owner_attempt?.startsWith(`${String(repository).toLowerCase()}:`)) {
+    return { outcome: 'preserve' };
+  }
+  const eligible = () => prMatches(request, repository, prNumber, state.head_sha,
+    'agent:needs-attention', 'needs-human').catch(() => false);
+  if (!await eligible()) return { outcome: 'preserve' };
+
+  const expectedIndex = {
+    version: 1,
+    repository: String(repository).toLowerCase(),
+    owner_attempt: state.receipt.owner_attempt,
+    pr_number: Number(prNumber),
+    generation: state.generation,
+    receipt: state.receipt,
+  };
+  let index;
+  try {
+    index = await readAttemptIndex(request, repository, state.receipt.owner_attempt,
+      { allowMissing: true });
+    if (!index) {
+      try {
+        index = await createAttemptIndex(request, repository, state.receipt.owner_attempt,
+          expectedIndex);
+      } catch (_) {
+        index = await readAttemptIndex(request, repository, state.receipt.owner_attempt,
+          { allowMissing: true });
+      }
+    }
+  } catch (_) {
+    return { outcome: 'preserve' };
+  }
+  if (!index || !legacyPreparedAttemptMatchesIndex(state, index, repository, prNumber)) {
+    return { outcome: 'preserve' };
+  }
+
+  const current = await readAuthorityState(request, repository, prNumber).catch(() => null);
+  if (!current || !legacyPreparedAttemptMatchesIndex(
+    current.state, index, repository, prNumber,
+  ) || current.state.generation !== state.generation ||
+      !sameReceipt(current.state.receipt, state.receipt) || !await eligible()) {
+    return { outcome: 'preserve' };
+  }
+  const nowMs = now.getTime();
+  const next = {
+    ...current.state,
+    generation: crypto.randomBytes(32).toString('hex'),
+    due_at: new Date(nowMs).toISOString(),
+    expires_at: new Date(nowMs + 24 * 60 * 60 * 1000).toISOString(),
+    status: 'available',
+    receipt: null,
+    prepared_claim: null,
+    released_receipt: current.state.receipt,
+    released_generation: current.state.generation,
+    released_generation_lineage: [current.state.generation],
+    revision: current.state.revision + 1,
+  };
+  try {
+    await writeAuthorityState(request, repository, prNumber, next, current.sha);
+  } catch (_) {
+    const settled = await readAuthorityState(request, repository, prNumber).catch(() => null);
+    const exactRelease = settled?.state.status === 'available' &&
+      settled.state.receipt === null && settled.state.generation === next.generation &&
+      settled.state.head_sha === state.head_sha &&
+      settled.state.released_generation === state.generation &&
+      sameReceipt(settled.state.released_receipt, state.receipt) &&
+      settled.state.revision === next.revision;
+    if (!exactRelease) {
+      return { outcome: settled?.sha !== current.sha ? 'retry' : 'preserve' };
+    }
+  }
+  if (!await eligible()) return { outcome: 'preserve' };
+  return { outcome: 'recovered' };
+}
+
+async function recoverExpiredPreparation({ request, repository, prNumber, prior, now }) {
+  const state = prior.state;
+  if (state.status !== 'prepared' || now.getTime() < Date.parse(state.expires_at)) {
+    return { outcome: 'preserve' };
+  }
+  if (state.prepared_claim === undefined) {
+    return recoverExpiredLegacyPreparation({ request, repository, prNumber, prior, now });
+  }
+  let index;
+  try {
+    index = await readAttemptIndex(request, repository, state.receipt?.owner_attempt);
+  } catch (_) {
+    return { outcome: 'preserve' };
+  }
+  if (!preparedAttemptMatchesIndex(state, index, repository, prNumber) ||
+      !await prMatches(request, repository, prNumber, state.head_sha,
+        'agent:needs-attention', 'needs-human').catch(() => false)) {
+    return { outcome: 'preserve' };
+  }
+  const released = await releasePreparedChallenge({
+    request, repository, prNumber, claim: state.prepared_claim,
+    ownerAttempt: state.receipt.owner_attempt, provider: state.receipt.provider,
+    headSha: state.head_sha, now,
+  });
+  if (!released.released) {
+    return { outcome: ['challenge-conflict', 'challenge-preparation-not-current']
+      .includes(released.reason) ? 'retry' : 'preserve' };
+  }
+  const settled = await readAuthorityState(request, repository, prNumber).catch(() => null);
+  const exactRelease = settled?.state.status === 'available' && settled.state.receipt === null &&
+    settled.state.head_sha === state.head_sha &&
+    settled.state.released_generation === state.generation &&
+    settled.state.released_receipt?.id === state.receipt.id &&
+    settled.state.released_receipt?.owner_attempt === state.receipt.owner_attempt;
+  if (!exactRelease || !await prMatches(request, repository, prNumber, state.head_sha,
+    'agent:needs-attention', 'needs-human').catch(() => false)) {
+    return { outcome: 'preserve' };
+  }
+  return { outcome: 'recovered' };
+}
+
+async function beginChallenge({ request, repository, prNumber, defaultBranch, fingerprint, dueAt, expiresAt, headSha, expectedGeneration = null, now = new Date() }) {
+  if (!HEX.test(String(fingerprint)) || !HEAD.test(String(headSha)) ||
+      !exactTime(dueAt) || !exactTime(expiresAt) ||
+      Date.parse(expiresAt) <= Date.parse(dueAt) ||
+      !(now instanceof Date) || !Number.isFinite(now.getTime())) {
+    throw new Error('Invalid challenge boundary');
+  }
+  await ensureBranch(request, repository, defaultBranch);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const prior = await readAuthorityState(request, repository, prNumber, { allowMissing: true });
+    if (expectedGeneration && (!prior ||
+        !expectedGenerationMatches(prior.state, expectedGeneration, headSha))) {
+      throw new Error('Previously initialized challenge generation is missing or superseded');
+    }
+    // Consumed and confirmed receipts remain spent on expiry. A prepared receipt
+    // is non-authorizing and can be reaped only after its exact immutable attempt
+    // index and current PR routing state have both been verified.
+    if (prior && prior.state.head_sha === headSha && prior.state.status !== 'available') {
+      if (prior.state.status === 'prepared' &&
+          now.getTime() >= Date.parse(prior.state.expires_at)) {
+        const recovery = await recoverExpiredPreparation({
+          request, repository, prNumber, prior, now,
+        });
+        if (['recovered', 'retry'].includes(recovery.outcome)) continue;
+      }
+      return prior.state;
+    }
+    if (prior && prior.state.boundary_fingerprint === fingerprint &&
+        prior.state.head_sha === headSha) {
+      if (Date.parse(prior.state.expires_at) > now.getTime()) {
+        return prior.state;
+      }
+    }
+    const releasedState = prior?.state.head_sha === headSha &&
+      prior.state.status === 'available' && prior.state.released_receipt
+      ? {
+          released_receipt: prior.state.released_receipt,
+          released_generation: prior.state.released_generation || prior.state.generation,
+          released_generation_lineage: [...new Set([
+            ...(prior.state.released_generation_lineage || []),
+            prior.state.released_generation || prior.state.generation,
+            prior.state.generation,
+          ])],
+        }
+      : {};
+    const state = {
+      version: 2,
+      repository: String(repository).toLowerCase(),
+      pr_number: Number(prNumber),
+      generation: crypto.randomBytes(32).toString('hex'),
+      boundary_fingerprint: fingerprint,
+      head_sha: headSha,
+      due_at: dueAt,
+      expires_at: expiresAt,
+      status: 'available',
+      receipt: null,
+      revision: (prior?.state.revision || 0) + 1,
+      ...releasedState,
+    };
+    try {
+      await writeAuthorityState(request, repository, prNumber, state, prior?.sha);
+      return state;
+    } catch (error) {
+      if (![409, 422].includes(error.status)) throw error;
+    }
+  }
+  throw new Error('Concurrent challenge generation updates did not settle');
+}
+
+function claimMatchesState(claim, state, now = new Date()) {
+  return state.status === 'available' &&
+    claim.generation === state.generation &&
+    claim.boundary_fingerprint === state.boundary_fingerprint &&
+    claim.due_at === state.due_at && claim.expires_at === state.expires_at &&
+    claim.head_sha === state.head_sha &&
+    Number.isFinite(now.getTime()) && Date.parse(state.due_at) <= now.getTime() &&
+    now.getTime() < Date.parse(state.expires_at);
+}
+
+async function prepareChallenge({ request, repository, prNumber, claim, ownerAttempt, provider, headSha, now = new Date() }) {
+  const prior = await readAuthorityState(request, repository, prNumber);
+  if (!claimMatchesState(claim, prior.state, now) || !ATTEMPT.test(String(ownerAttempt)) ||
+      !HEAD.test(String(headSha)) || claim.head_sha !== headSha) {
+    return { prepared: false, reason: 'challenge-not-current' };
+  }
+  if (prior.state.released_receipt?.owner_attempt === ownerAttempt ||
+      prior.state.recovered_receipt?.owner_attempt === ownerAttempt) {
+    return { prepared: false, reason: 'attempt-already-settled' };
+  }
+  const receipt = {
+    id: crypto.randomBytes(32).toString('hex'),
+    claim_digest: crypto.createHash('sha256').update(JSON.stringify(claim)).digest('hex'),
+    owner_attempt: ownerAttempt,
+    provider,
+    head_sha: headSha,
+    consumed_at: now.toISOString(),
+  };
+  const candidate = { version: 1, repository: String(repository).toLowerCase(),
+    owner_attempt: ownerAttempt, pr_number: Number(prNumber),
+    generation: prior.state.generation, receipt };
+  let index;
+  try {
+    index = await createAttemptIndex(request, repository, ownerAttempt, candidate);
+  } catch (_) {
+    return { prepared: false, reason: 'attempt-index-uncertain' };
+  }
+  if (index.pr_number !== Number(prNumber) || index.generation !== prior.state.generation ||
+      index.receipt.claim_digest !== receipt.claim_digest ||
+      index.receipt.provider !== provider || index.receipt.head_sha !== headSha) {
+    return { prepared: false, reason: 'attempt-index-conflict' };
+  }
+  const next = { ...prior.state, status: 'prepared', receipt: index.receipt,
+    prepared_claim: claim, recovered_receipt: null, recovered_generation: null,
+    recovered_generation_lineage: [],
+    released_receipt: null, released_generation: null, released_generation_lineage: [],
+    revision: prior.state.revision + 1 };
+  try {
+    await writeAuthorityState(request, repository, prNumber, next, prior.sha);
+  } catch (error) {
+    return { prepared: false, reason: [409, 422].includes(error.status) ? 'challenge-conflict' : 'challenge-write-uncertain' };
+  }
+  return { prepared: true, reason: 'challenge-prepared', receipt: index.receipt };
+}
+
+function receiptMatches(receipt, claim, ownerAttempt, provider, headSha) {
+  return receipt &&
+    receipt.claim_digest === crypto.createHash('sha256').update(JSON.stringify(claim)).digest('hex') &&
+    receipt.owner_attempt === ownerAttempt && receipt.provider === provider &&
+    receipt.head_sha === headSha;
+}
+
+async function finalizeChallenge({ request, repository, prNumber, claim, ownerAttempt, provider, headSha }) {
+  const prior = await readAuthorityState(request, repository, prNumber);
+  if (prior.state.status !== 'prepared' || prior.state.head_sha !== headSha ||
+      prior.state.generation !== claim.generation ||
+      !receiptMatches(prior.state.receipt, claim, ownerAttempt, provider, headSha)) {
+    return { granted: false, reason: 'challenge-preparation-not-current' };
+  }
+  let index;
+  try {
+    index = await readAttemptIndex(request, repository, ownerAttempt);
+  } catch (_) {
+    return { granted: false, reason: 'attempt-index-unavailable' };
+  }
+  if (index.pr_number !== Number(prNumber) || index.generation !== prior.state.generation ||
+      index.receipt.id !== prior.state.receipt.id ||
+      index.receipt.claim_digest !== prior.state.receipt.claim_digest ||
+      index.receipt.provider !== provider || index.receipt.head_sha !== headSha) {
+    return { granted: false, reason: 'attempt-index-conflict' };
+  }
+  // Persist the exact claim beside its receipt. A workflow_run reporter may need to
+  // reopen this reservation after the owning run fails before an agent starts, and
+  // the nonce/sweep identity cannot be reconstructed from presentation state.
+  const next = {
+    ...prior.state,
+    status: 'consumed',
+    consumed_claim: claim,
+    revision: prior.state.revision + 1,
+  };
+  try {
+    await writeAuthorityState(request, repository, prNumber, next, prior.sha);
+  } catch (error) {
+    return { granted: false, reason: [409, 422].includes(error.status) ? 'challenge-conflict' : 'challenge-write-uncertain' };
+  }
+  // The ledger is the single-use authority, but PR metadata is a separate
+  // resource. Deny a grant if the head or routing labels changed during PUT.
+  // The receipt remains spent even when this final read is unavailable.
+  if (!await prMatches(request, repository, prNumber, headSha, 'agent:needs-attention', 'needs-human')) {
+    return { granted: false, reason: 'challenge-pr-state-changed' };
+  }
+  return { granted: true, reason: 'due-authority-challenge', receipt: prior.state.receipt };
+}
+
+async function releasePreparedChallenge({ request, repository, prNumber, claim, ownerAttempt, provider, headSha,
+  now = new Date() }) {
+  if (!(now instanceof Date) || !Number.isFinite(now.getTime())) {
+    return { released: false, reason: 'challenge-time-invalid' };
+  }
+  const prior = await readAuthorityState(request, repository, prNumber);
+  if (prior.state.status === 'available' && prior.state.receipt === null &&
+      prior.state.head_sha === headSha &&
+      (prior.state.released_generation || prior.state.generation) === claim.generation &&
+      receiptMatches(prior.state.released_receipt, claim, ownerAttempt, provider, headSha)) {
+    // The conditional PUT may have committed even when its response was lost.
+    // An exact retry is settled; a newer preparation is never refunded.
+    if (now.getTime() >= Date.parse(prior.state.expires_at)) {
+      const refreshed = await refreshReleasedChallenge({
+        request, repository, prNumber, ownerAttempt, prior, now,
+      });
+      return { released: refreshed.status === 'released', reason: refreshed.reason };
+    }
+    return { released: true, reason: 'challenge-preparation-already-released' };
+  }
+  if (prior.state.status !== 'prepared' || prior.state.head_sha !== headSha ||
+      prior.state.generation !== claim.generation ||
+      !receiptMatches(prior.state.receipt, claim, ownerAttempt, provider, headSha)) {
+    return { released: false, reason: 'challenge-preparation-not-current' };
+  }
+  const expired = now.getTime() >= Date.parse(prior.state.expires_at);
+  if (expired && !await prMatches(request, repository, prNumber, headSha,
+    'agent:needs-attention', 'needs-human').catch(() => false)) {
+    return { released: false, reason: 'challenge-pr-state-unavailable' };
+  }
+  const nowMs = now.getTime();
+  const next = { ...prior.state, status: 'available', receipt: null,
+    prepared_claim: null, released_receipt: prior.state.receipt,
+    released_generation: claim.generation,
+    released_generation_lineage: [claim.generation],
+    ...(expired ? { generation: crypto.randomBytes(32).toString('hex'),
+      due_at: new Date(nowMs).toISOString(),
+      expires_at: new Date(nowMs + 24 * 60 * 60 * 1000).toISOString() } : {}),
+    revision: prior.state.revision + 1 };
+  try {
+    await writeAuthorityState(request, repository, prNumber, next, prior.sha);
+    return { released: true, reason: expired ? 'challenge-preparation-released-refreshed' :
+      'challenge-preparation-released' };
+  } catch (error) {
+    const settled = await readAuthorityState(request, repository, prNumber).catch(() => null);
+    if (settled?.state.status === 'available' && settled.state.generation === next.generation &&
+        settled.state.released_generation === claim.generation &&
+        settled.state.released_receipt?.id === prior.state.receipt.id) {
+      return { released: true, reason: 'challenge-preparation-already-released' };
+    }
+    return { released: false, reason: [409, 422].includes(error.status) ?
+      'challenge-conflict' : 'challenge-write-uncertain' };
+  }
+}
+
+async function refreshReleasedChallenge({ request, repository, prNumber, ownerAttempt, prior = null,
+  now = new Date() }) {
+  if (!(now instanceof Date) || !Number.isFinite(now.getTime())) {
+    return { status: 'uncertain', reason: 'challenge-time-invalid' };
+  }
+  const current = prior || await readAuthorityState(request, repository, prNumber);
+  const state = current.state;
+  if (state.status !== 'available' || state.receipt !== null ||
+      state.released_receipt?.owner_attempt !== ownerAttempt) {
+    return { status: 'uncertain', reason: 'released-attempt-not-current' };
+  }
+  const target = await findAuthorityPrForAttempt({ request, repository, ownerAttempt }).catch(() => null);
+  if (target?.prNumber !== Number(prNumber)) {
+    return { status: 'uncertain', reason: 'released-attempt-index-unavailable' };
+  }
+  if (!await prMatches(request, repository, prNumber, state.head_sha,
+    'agent:needs-attention', 'needs-human').catch(() => false)) {
+    return { status: 'uncertain', reason: 'challenge-pr-state-unavailable' };
+  }
+  if (now.getTime() < Date.parse(state.expires_at)) {
+    return { status: 'released', reason: 'already-current', state,
+      previousGenerations: state.released_generation_lineage ||
+        [state.released_generation || state.generation] };
+  }
+  const nowMs = now.getTime();
+  const lineage = [...new Set([...(state.released_generation_lineage || []),
+    state.released_generation || state.generation, state.generation])];
+  const next = { ...state, generation: crypto.randomBytes(32).toString('hex'),
+    due_at: new Date(nowMs).toISOString(),
+    expires_at: new Date(nowMs + 24 * 60 * 60 * 1000).toISOString(),
+    released_generation: state.released_generation || state.generation,
+    released_generation_lineage: lineage, revision: state.revision + 1 };
+  try {
+    await writeAuthorityState(request, repository, prNumber, next, current.sha);
+    return { status: 'released', reason: 'released-window-refreshed', state: next,
+      previousGenerations: lineage };
+  } catch (_) {
+    const settled = await readAuthorityState(request, repository, prNumber).catch(() => null);
+    if (settled?.state.status === 'available' && settled.state.receipt === null &&
+        settled.state.released_receipt?.id === state.released_receipt.id &&
+        settled.state.generation === next.generation) {
+      return { status: 'released', reason: 'released-window-refreshed', state: settled.state,
+        previousGenerations: settled.state.released_generation_lineage };
+    }
+    return { status: 'uncertain', reason: 'released-window-write-uncertain' };
+  }
+}
+
+async function refreshRecoveredChallenge({ request, repository, prNumber, ownerAttempt, prior = null,
+  now = new Date() }) {
+  if (!(now instanceof Date) || !Number.isFinite(now.getTime())) {
+    return { status: 'uncertain', reason: 'challenge-time-invalid' };
+  }
+  const current = prior || await readAuthorityState(request, repository, prNumber);
+  const state = current.state;
+  if (state.status !== 'available' || state.receipt !== null ||
+      state.recovered_receipt?.owner_attempt !== ownerAttempt ||
+      !HEX.test(state.recovered_generation)) {
+    return { status: 'uncertain', reason: 'recovered-attempt-not-current' };
+  }
+  let index;
+  try {
+    index = await readAttemptIndex(request, repository, ownerAttempt);
+  } catch (_) {
+    return { status: 'uncertain', reason: 'recovered-attempt-index-unavailable' };
+  }
+  if (!recoveredAttemptMatchesIndex(state, index, repository, prNumber, ownerAttempt)) {
+    return { status: 'uncertain', reason: 'recovered-attempt-index-unavailable' };
+  }
+  const eligible = () => prMatches(request, repository, prNumber, state.head_sha,
+    'agent:needs-attention', 'needs-human').catch(() => false);
+  if (!await eligible()) {
+    return { status: 'uncertain', reason: 'challenge-pr-state-unavailable' };
+  }
+  const previousGenerations = state.recovered_generation_lineage ||
+    [state.recovered_generation];
+  if (now.getTime() < Date.parse(state.expires_at)) {
+    return { status: 'reopened', reason: 'already-current', state,
+      previousGeneration: state.recovered_generation, previousGenerations };
+  }
+  const nowMs = now.getTime();
+  const lineage = nextRecoveredLineage(state);
+  const next = { ...state, generation: crypto.randomBytes(32).toString('hex'),
+    due_at: new Date(nowMs).toISOString(),
+    expires_at: new Date(nowMs + 24 * 60 * 60 * 1000).toISOString(),
+    recovered_generation: state.recovered_generation,
+    recovered_generation_lineage: lineage,
+    revision: state.revision + 1 };
+  let settledState = next;
+  try {
+    await writeAuthorityState(request, repository, prNumber, next, current.sha);
+  } catch (_) {
+    const settled = await readAuthorityState(request, repository, prNumber).catch(() => null);
+    const exactRefresh = settled?.state.status === 'available' && settled.state.receipt === null &&
+      settled.state.generation === next.generation &&
+      settled.state.head_sha === state.head_sha &&
+      settled.state.boundary_fingerprint === state.boundary_fingerprint &&
+      settled.state.due_at === next.due_at && settled.state.expires_at === next.expires_at &&
+      settled.state.revision === next.revision &&
+      settled.state.recovered_generation === state.recovered_generation &&
+      sameReceipt(settled.state.recovered_receipt, state.recovered_receipt) &&
+      JSON.stringify(settled.state.recovered_generation_lineage) === JSON.stringify(lineage);
+    if (!exactRefresh) {
+      return { status: 'uncertain', reason: 'recovered-window-write-uncertain' };
+    }
+    settledState = settled.state;
+  }
+  if (!await eligible()) {
+    return { status: 'uncertain', reason: 'challenge-pr-state-unavailable' };
+  }
+  return { status: 'reopened', reason: 'recovered-window-refreshed', state: settledState,
+    previousGeneration: state.recovered_generation, previousGenerations: lineage };
+}
+
+async function consumeChallenge(options) {
+  const prepared = await prepareChallenge(options);
+  if (!prepared.prepared) return { granted: false, reason: prepared.reason };
+  return finalizeChallenge(options);
+}
+
+async function readPrState(request, repository, prNumber) {
+  const pr = await request('GET', `/repos/${String(repository).toLowerCase()}/pulls/${Number(prNumber)}`);
+  if (!pr || !Array.isArray(pr.labels) || typeof pr?.head?.sha !== 'string') {
+    throw new Error('PR state response is incomplete');
+  }
+  const labels = new Set(pr.labels.map((label) => String(label.name || '').toLowerCase()));
+  return { open: pr.state === 'open', headSha: pr.head.sha, labels };
+}
+
+async function prMatches(request, repository, prNumber, headSha, requiredLabel, excludedLabel = null) {
+  const pr = await readPrState(request, repository, prNumber);
+  return pr.open && pr.headSha === headSha &&
+    pr.labels.has(requiredLabel) && (!excludedLabel || !pr.labels.has(excludedLabel));
+}
+
+async function confirmChallenge({ request, repository, prNumber, claim, ownerAttempt, provider, headSha }) {
+  const prior = await readAuthorityState(request, repository, prNumber);
+  const receipt = prior.state.receipt;
+  if (!receipt ||
+      Date.now() >= Date.parse(prior.state.expires_at) ||
+      prior.state.generation !== claim.generation ||
+      prior.state.boundary_fingerprint !== claim.boundary_fingerprint ||
+      prior.state.due_at !== claim.due_at || prior.state.expires_at !== claim.expires_at ||
+      prior.state.head_sha !== headSha || claim.head_sha !== headSha ||
+      receipt.claim_digest !== crypto.createHash('sha256').update(JSON.stringify(claim)).digest('hex') ||
+      receipt.owner_attempt !== ownerAttempt || receipt.provider !== provider ||
+      receipt.head_sha !== headSha) return false;
+  if (prior.state.status === 'confirmed') {
+    return prMatches(request, repository, prNumber, headSha, 'needs-human');
+  }
+  if (prior.state.status !== 'consumed') return false;
+  if (!await prMatches(request, repository, prNumber, headSha, 'needs-human')) return false;
+  const next = { ...prior.state, status: 'confirmed', revision: prior.state.revision + 1 };
+  try {
+    await writeAuthorityState(request, repository, prNumber, next, prior.sha);
+    return prMatches(request, repository, prNumber, headSha, 'needs-human');
+  } catch (_) {
+    const settled = await readAuthorityState(request, repository, prNumber).catch(() => null);
+    return settled?.state.status === 'confirmed' &&
+      settled.state.generation === claim.generation &&
+      settled.state.receipt?.id === receipt.id &&
+      await prMatches(request, repository, prNumber, headSha, 'needs-human');
+  }
+}
+
+async function reopenUnconfirmedChallenge({ request, repository, prNumber, claim, ownerAttempt, provider, headSha,
+  workerEvidence = 'unknown' }) {
+  const prior = await readAuthorityState(request, repository, prNumber);
+  if (prior.state.head_sha !== headSha) return { status: 'uncertain', state: prior.state };
+  const receipt = prior.state.receipt;
+  const recoveryClaim = claim && typeof claim === 'object' ? claim : prior.state.consumed_claim;
+  const matches = recoveryClaim &&
+    prior.state.generation === recoveryClaim.generation &&
+    prior.state.boundary_fingerprint === recoveryClaim.boundary_fingerprint &&
+    receipt?.claim_digest ===
+      crypto.createHash('sha256').update(JSON.stringify(recoveryClaim)).digest('hex') &&
+    receipt.owner_attempt === ownerAttempt && receipt.provider === provider && receipt.head_sha === headSha;
+  const pr = await readPrState(request, repository, prNumber);
+  if (!pr.open || pr.headSha !== headSha) return { status: 'uncertain', state: prior.state };
+  if (matches && pr.labels.has('needs-human')) {
+    return { status: prior.state.status === 'confirmed' ? 'confirmed' : 'uncertain', state: prior.state };
+  }
+  // A confirmed receipt has already crossed the hard-human boundary. An
+  // absent label (or a stale PR read) must never rotate it into fresh grant
+  // authority; only an unconfirmed consumed receipt is recoverable here.
+  if (!matches || prior.state.status !== 'consumed' || workerEvidence !== 'not-started') {
+    return { status: 'uncertain', state: prior.state };
+  }
+  const now = Date.now();
+  const state = {
+    ...prior.state,
+    generation: crypto.randomBytes(32).toString('hex'),
+    due_at: new Date(now).toISOString(),
+    expires_at: new Date(now + 24 * 60 * 60 * 1000).toISOString(),
+    status: 'available', receipt: null, prepared_claim: null, consumed_claim: null,
+    recovered_receipt: receipt, recovered_generation: prior.state.generation,
+    recovered_generation_lineage: [prior.state.generation],
+    revision: prior.state.revision + 1,
+  };
+  try {
+    await writeAuthorityState(request, repository, prNumber, state, prior.sha);
+    return { status: 'reopened', state };
+  } catch (_) {
+    const settled = await readAuthorityState(request, repository, prNumber).catch(() => null);
+    if (recoveryClaim && settled?.state.status === 'confirmed' &&
+        settled.state.generation === recoveryClaim.generation &&
+        settled.state.receipt?.id === receipt.id &&
+        await prMatches(request, repository, prNumber, headSha, 'needs-human')) {
+      return { status: 'confirmed', state: settled.state };
+    }
+    if (settled?.state.status === 'available' && settled.state.generation === state.generation) {
+      return { status: 'reopened', state: settled.state };
+    }
+    return { status: 'uncertain', state: settled?.state };
+  }
+}
+
+async function authorityAttemptOwnsRecoveryReceipt({
+  request,
+  repository,
+  prNumber,
+  ownerAttempt,
+}) {
+  const normalized = String(ownerAttempt || '').toLowerCase();
+  if (!normalized || !/^[a-z0-9_.-]+\/[a-z0-9_.-]+:\d+:\d+$/.test(normalized)) {
+    return false;
+  }
+  const { state } = await readAuthorityState(request, repository, prNumber);
+  const receipts = [state.receipt, state.released_receipt, state.recovered_receipt].filter(Boolean);
+  return receipts.some((receipt) => receipt.owner_attempt === normalized &&
+    receipt.head_sha === state.head_sha &&
+    Boolean(receipt.provider));
+}
+
+async function reconcileFailedAuthorityAttempt({ request, repository, prNumber, ownerAttempt, workerEvidence }) {
+  if (workerEvidence !== 'not-started') return { status: 'execution-not-disproved' };
+  const { state } = await readAuthorityState(request, repository, prNumber);
+  if (state.status === 'available' && state.recovered_receipt?.owner_attempt === ownerAttempt) {
+    return refreshRecoveredChallenge({ request, repository, prNumber, ownerAttempt });
+  }
+  if (state.status === 'available' && state.released_receipt?.owner_attempt === ownerAttempt) {
+    return refreshReleasedChallenge({ request, repository, prNumber, ownerAttempt });
+  }
+  const receipt = state.receipt;
+  if (!receipt || receipt.owner_attempt !== ownerAttempt ||
+      receipt.head_sha !== state.head_sha || !receipt.provider) {
+    return { status: 'attempt-not-current' };
+  }
+  const claim = state.status === 'prepared' ? state.prepared_claim : state.consumed_claim;
+  if (!claim || claim.head_sha !== state.head_sha ||
+      !receiptMatches(receipt, claim, ownerAttempt, receipt.provider, state.head_sha)) {
+    return { status: 'claim-not-current' };
+  }
+  const options = { request, repository, prNumber, claim, ownerAttempt,
+    provider: receipt.provider, headSha: state.head_sha, workerEvidence };
+  if (state.status === 'prepared') {
+    const result = await releasePreparedChallenge(options);
+    if (!result.released) return { status: 'uncertain', reason: result.reason };
+    const settled = await readAuthorityState(request, repository, prNumber);
+    if (settled.state.status !== 'available' ||
+        !receiptMatches(settled.state.released_receipt, claim, ownerAttempt,
+          receipt.provider, state.head_sha)) return { status: 'uncertain' };
+    if (!await prMatches(request, repository, prNumber, state.head_sha,
+      'agent:needs-attention', 'needs-human').catch(() => false)) {
+      return { status: 'uncertain', reason: 'challenge-pr-state-unavailable' };
+    }
+    return { status: 'released', reason: result.reason, state: settled.state,
+      previousGenerations: settled.state.released_generation_lineage || [claim.generation] };
+  }
+  if (state.status === 'consumed') {
+    const result = await reopenUnconfirmedChallenge(options);
+    return { ...result, previousGeneration: state.generation };
+  }
+  return { status: 'receipt-not-recoverable' };
+}
+
+async function findAuthorityPrForAttempt({ request, repository, ownerAttempt }) {
+  const index = await readAttemptIndex(request, repository, ownerAttempt, { allowMissing: true });
+  if (!index) return null;
+  const { state } = await readAuthorityState(request, repository, index.pr_number);
+  const receipts = [state.receipt, state.released_receipt, state.recovered_receipt];
+  if (!receipts.some((receipt) => receipt?.id === index.receipt.id &&
+      receipt.owner_attempt === ownerAttempt && receipt.claim_digest === index.receipt.claim_digest &&
+      receipt.head_sha === index.receipt.head_sha && receipt.provider === index.receipt.provider)) {
+    throw new Error('Authority attempt index does not match PR ledger receipt');
+  }
+  return { prNumber: index.pr_number, state };
+}
+
+async function hasAttemptIndexesForPr(request, repository, prNumber) {
+  pathFor(repository, prNumber);
+  const snapshot = await attemptIndexTree(request, repository);
+  if (snapshot.treeSha === null) {
+    // The first index may be created by a legacy writer after this snapshot.
+    // Missing directories need the same freshness fence as cached negatives.
+    const current = await attemptIndexTree(request, snapshot.repo);
+    if (current.treeSha !== null) {
+      throw new Error('Authority attempt indexes changed during absence read');
+    }
+    return false;
+  }
+  let inventory = await readAttemptPresence(request, snapshot.repo, snapshot.treeSha, snapshot.commitSha);
+  if (!inventory) {
+    const checkpoint = await readPresenceCheckpoint(request, snapshot);
+    const bootstrap = !checkpoint ? await readBootstrapPresence(request, snapshot) : null;
+    if (!checkpoint && !bootstrap && snapshot.presenceExists) {
+      throw new Error('Authority presence checkpoint missing from existing v2 directory');
+    }
+    const previous = checkpoint ? await readAttemptPresence(request, snapshot.repo,
+      checkpoint.treeSha, snapshot.commitSha) : bootstrap;
+    if (checkpoint && !previous) throw new Error('Authority presence checkpoint manifest missing');
+    if (previous) await validatePresenceTree(request, snapshot.repo, previous);
+    const entries = await scanAttemptIndexes(request, snapshot, previous);
+    // A writer may have added an index while this complete scan was in flight.
+    // Never publish an absence result for a different subtree.
+    const current = await attemptIndexTree(request, snapshot.repo);
+    if (!current || current.treeSha !== snapshot.treeSha) {
+      throw new Error('Authority attempt indexes changed during inventory backfill');
+    }
+    // Publish a fixed, complete recovery manifest before the keyed publication.
+    // If any later response is lost and an older writer advances the tree, the
+    // next process still has a known validated base without history discovery.
+    if (!checkpoint && !bootstrap) await createBootstrapPresence(request, snapshot, entries);
+    inventory = await createAttemptPresence(request, snapshot, entries);
+    const settled = await attemptIndexTree(request, snapshot.repo);
+    if (!settled || settled.treeSha !== snapshot.treeSha) {
+      throw new Error('Authority attempt indexes changed during inventory publication');
+    }
+    await advancePresenceCheckpoint(request, snapshot, checkpoint);
+  }
+  await validatePresenceTree(request, snapshot.repo, inventory);
+  // A previous invocation may have published the complete manifest but lost its
+  // response before advancing the pointer. Repair only from that exact manifest.
+  const checkpoint = await readPresenceCheckpoint(request, snapshot, BRANCH);
+  if (!checkpoint || checkpoint.treeSha !== snapshot.treeSha) {
+    await advancePresenceCheckpoint(request, snapshot, checkpoint);
+  }
+  const current = await attemptIndexTree(request, snapshot.repo);
+  if (!current || current.treeSha !== snapshot.treeSha) {
+    throw new Error('Authority attempt indexes changed during presence read');
+  }
+  return inventory.positive_prs.includes(Number(prNumber));
+}
+
+async function attemptIndexTree(request, repository) {
+  const repo = String(repository).toLowerCase();
+  const ref = await request('GET', `/repos/${repo}/git/ref/heads/${BRANCH}`);
+  const commitSha = ref?.object?.sha;
+  if (ref?.object?.type !== 'commit' || !HEAD.test(String(commitSha))) {
+    throw new Error('Authority attempt branch did not resolve to a commit');
+  }
+  const commit = await request('GET', `/repos/${repo}/git/commits/${commitSha}`);
+  let treeSha = commit?.tree?.sha;
+  let presenceExists = false;
+  const segments = ['.github', 'keepalive-authority-attempts'];
+  // Non-recursive trees avoid the Contents API's 1,000-entry directory limit.
+  // Every later read uses immutable SHAs from this one branch snapshot.
+  for (const segment of [...segments, null]) {
+    if (!HEAD.test(String(treeSha))) throw new Error('Invalid authority attempt tree SHA');
+    const tree = await request('GET', `/repos/${repo}/git/trees/${treeSha}`);
+    if (tree?.truncated !== false || !Array.isArray(tree.tree) ||
+        !tree.tree.every((entry) => entry && typeof entry.path === 'string' &&
+          entry.path.length > 0 && !entry.path.includes('/') &&
+          ['blob', 'tree', 'commit'].includes(entry.type) && HEAD.test(String(entry.sha))) ||
+        new Set(tree.tree.map((entry) => entry.path)).size !== tree.tree.length) {
+      throw new Error('Incomplete or malformed authority attempt tree');
+    }
+    if (segment !== null) {
+      if (segment === 'keepalive-authority-attempts') {
+        const presence = tree.tree.find((item) => item.path === 'keepalive-authority-presence-v2');
+        if (presence && presence.type !== 'tree') throw new Error('Invalid authority presence directory');
+        presenceExists = Boolean(presence);
+      }
+      const entry = tree.tree.find((item) => item.path === segment);
+      if (!entry) return { repo, commitSha, treeSha: null };
+      if (entry.type !== 'tree') throw new Error('Authority attempt directory is not a tree');
+      treeSha = entry.sha;
+      continue;
+    }
+    return { repo, commitSha, treeSha, presenceExists };
+  }
+  throw new Error('Authority attempt tree traversal did not settle');
+}
+
+async function scanAttemptIndexes(request, snapshot, previous = null) {
+  const tree = await request('GET', `/repos/${snapshot.repo}/git/trees/${snapshot.treeSha}`);
+  if (tree?.truncated !== false || !Array.isArray(tree.tree) ||
+      new Set(tree.tree.map((entry) => entry.path)).size !== tree.tree.length) {
+    throw new Error('Incomplete or malformed authority attempt tree');
+  }
+  const cached = new Map((previous?.entries || []).map((entry) => [entry.path, entry]));
+  const entries = [];
+  for (const entry of tree.tree) {
+      if (!/^[0-9a-f]{64}\.json$/.test(entry.path) || entry.type !== 'blob' || !HEAD.test(String(entry.sha))) {
+        throw new Error('Invalid authority attempt index path');
+      }
+      const prior = cached.get(entry.path);
+      if (prior && prior.blob_sha === entry.sha) {
+        entries.push(prior);
+        continue;
+      }
+      const blob = await request('GET', `/repos/${snapshot.repo}/git/blobs/${entry.sha}`);
+      if (blob?.sha !== entry.sha || blob?.encoding !== 'base64' ||
+          typeof blob.content !== 'string') {
+        throw new Error('Invalid authority attempt index metadata');
+      }
+      const encoded = blob.content.replace(/\s/g, '');
+      if (!encoded || Buffer.from(encoded, 'base64').toString('base64') !== encoded) {
+        throw new Error('Malformed authority attempt index base64');
+      }
+      const index = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
+      if (!validAttemptIndex(index, snapshot.repo, index?.owner_attempt) ||
+          attemptPath(snapshot.repo, index.owner_attempt).split('/').pop() !== entry.path) {
+        throw new Error('Invalid authority attempt index');
+      }
+      entries.push({ path: entry.path, blob_sha: entry.sha, pr_number: index.pr_number });
+    }
+  return entries.sort((left, right) => left.path.localeCompare(right.path));
+}
+
+function decodePresence(file, repository, treeSha) {
+  if (!HEAD.test(String(file?.sha)) || file?.encoding !== 'base64' || typeof file.content !== 'string') {
+    throw new Error('Invalid authority attempt presence metadata');
+  }
+  const encoded = file.content.replace(/\s/g, '');
+  if (!encoded || Buffer.from(encoded, 'base64').toString('base64') !== encoded) {
+    throw new Error('Malformed authority attempt presence base64');
+  }
+  let inventory;
+  try { inventory = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8')); } catch (error) {
+    throw new Error(`Malformed authority attempt presence: ${error.message}`);
+  }
+  if (inventory?.version !== 2 || inventory.repository !== repository ||
+      !HEAD.test(String(inventory.index_tree_sha)) || (treeSha && inventory.index_tree_sha !== treeSha) ||
+      !Array.isArray(inventory.positive_prs) ||
+      !inventory.positive_prs.every((value) => Number.isSafeInteger(value) && value > 0) ||
+      new Set(inventory.positive_prs).size !== inventory.positive_prs.length ||
+      inventory.positive_prs.some((value, index) => index && inventory.positive_prs[index - 1] >= value)) {
+    throw new Error('Invalid authority attempt presence');
+  }
+  if (!Array.isArray(inventory.entries) || !inventory.entries.every((entry, index) =>
+    entry && /^[0-9a-f]{64}\.json$/.test(entry.path) && HEAD.test(String(entry.blob_sha)) &&
+    Number.isSafeInteger(entry.pr_number) && entry.pr_number > 0 &&
+    (!index || inventory.entries[index - 1].path.localeCompare(entry.path) < 0)) ||
+    JSON.stringify(presenceMembership(inventory.entries)) !== JSON.stringify(inventory.positive_prs)) {
+    throw new Error('Invalid authority attempt presence manifest');
+  }
+  return inventory;
+}
+
+function presenceMembership(entries) {
+  return [...new Set(entries.map((entry) => entry.pr_number))].sort((left, right) => left - right);
+}
+
+async function readBootstrapPresence(request, snapshot, ref = snapshot.commitSha) {
+  try {
+    return decodePresence(await request('GET', `${bootstrapPresencePath(snapshot.repo)}?ref=${ref}`), snapshot.repo);
+  } catch (error) { if (error.status === 404) return null; throw error; }
+}
+
+async function createBootstrapPresence(request, snapshot, entries) {
+  const inventory = { version: 2, repository: snapshot.repo, index_tree_sha: snapshot.treeSha,
+    entries, positive_prs: presenceMembership(entries) };
+  try {
+    await request('PUT', bootstrapPresencePath(snapshot.repo), { branch: BRANCH,
+      message: `keepalive authority presence bootstrap ${snapshot.treeSha}`,
+      content: Buffer.from(`${JSON.stringify(inventory)}\n`).toString('base64') });
+  } catch (error) { if (![409, 422].includes(error.status)) throw error; }
+  const settled = await readBootstrapPresence(request, snapshot, BRANCH);
+  if (!settled || settled.index_tree_sha !== snapshot.treeSha ||
+      JSON.stringify(settled.entries) !== JSON.stringify(entries)) {
+    throw new Error('Authority presence bootstrap conflicts with validated inventory');
+  }
+}
+
+async function validatePresenceTree(request, repository, inventory) {
+  const tree = await request('GET', `/repos/${repository}/git/trees/${inventory.index_tree_sha}`);
+  if (tree?.truncated !== false || !Array.isArray(tree.tree) ||
+      tree.tree.length !== inventory.entries.length ||
+      new Set(tree.tree.map((entry) => entry.path)).size !== tree.tree.length) {
+    throw new Error('Authority presence manifest does not cover complete tree');
+  }
+  const entries = new Map(inventory.entries.map((entry) => [entry.path, entry]));
+  if (!tree.tree.every((entry) => entry.type === 'blob' && entries.get(entry.path)?.blob_sha === entry.sha)) {
+    throw new Error('Authority presence manifest differs from immutable tree');
+  }
+}
+
+async function readPresenceCheckpoint(request, snapshot, ref = snapshot.commitSha) {
+  let file;
+  try { file = await request('GET', `${checkpointPath(snapshot.repo)}?ref=${ref}`); }
+  catch (error) { if (error.status === 404) return null; throw error; }
+  const encoded = typeof file?.content === 'string' ? file.content.replace(/\s/g, '') : '';
+  if (!HEAD.test(String(file?.sha)) || file.encoding !== 'base64' || !encoded ||
+      Buffer.from(encoded, 'base64').toString('base64') !== encoded) {
+    throw new Error('Invalid authority presence checkpoint metadata');
+  }
+  const value = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
+  if (value?.version !== 2 || value.repository !== snapshot.repo || !HEAD.test(String(value.index_tree_sha))) {
+    throw new Error('Invalid authority presence checkpoint');
+  }
+  return { treeSha: value.index_tree_sha, fileSha: file.sha };
+}
+
+async function advancePresenceCheckpoint(request, snapshot, previous) {
+  const current = await attemptIndexTree(request, snapshot.repo);
+  if (!current || current.treeSha !== snapshot.treeSha) {
+    throw new Error('Authority attempt indexes changed during checkpoint publication');
+  }
+  const value = { version: 2, repository: snapshot.repo, index_tree_sha: snapshot.treeSha };
+  try {
+    await request('PUT', checkpointPath(snapshot.repo), { branch: BRANCH,
+      ...(previous ? { sha: previous.fileSha } : {}),
+      message: `keepalive authority presence checkpoint ${snapshot.treeSha}`,
+      content: Buffer.from(`${JSON.stringify(value)}\n`).toString('base64') });
+  } catch (error) {
+    if (![409, 422].includes(error.status)) throw error;
+  }
+  const settled = await readPresenceCheckpoint(request, snapshot, BRANCH);
+  if (!settled || settled.treeSha !== snapshot.treeSha) {
+    throw new Error('Authority presence checkpoint conflict or unconfirmed write');
+  }
+}
+
+async function readAttemptPresence(request, repository, treeSha, ref = BRANCH) {
+  try {
+    return decodePresence(await request('GET', `${presencePath(repository, treeSha)}?ref=${ref}`), repository, treeSha);
+  } catch (error) {
+    if (error.status === 404) return null;
+    throw error;
+  }
+}
+
+async function createAttemptPresence(request, snapshot, entries) {
+  const inventory = { version: 2, repository: snapshot.repo, index_tree_sha: snapshot.treeSha,
+    entries, positive_prs: presenceMembership(entries) };
+  try {
+    await request('PUT', presencePath(snapshot.repo, snapshot.treeSha), { branch: BRANCH,
+      message: `keepalive authority presence ${snapshot.treeSha}`,
+      content: Buffer.from(`${JSON.stringify(inventory)}\n`).toString('base64') });
+  } catch (error) {
+    if (![409, 422].includes(error.status)) throw error;
+  }
+  const settled = await readAttemptPresence(request, snapshot.repo, snapshot.treeSha, BRANCH);
+  if (!settled) throw new Error('Authority attempt presence write was not confirmed');
+  if (JSON.stringify(settled.entries) !== JSON.stringify(entries)) {
+    throw new Error('Authority attempt presence conflicts with validated inventory');
+  }
+  return settled;
+}
+
+module.exports = {
+  authorityAttemptOwnsRecoveryReceipt,
+  findAuthorityPrForAttempt,
+  hasAttemptIndexesForPr,
+  reconcileFailedAuthorityAttempt,
+  BRANCH,
+  beginChallenge,
+  claimMatchesState,
+  confirmChallenge,
+  consumeChallenge,
+  finalizeChallenge,
+  prepareChallenge,
+  readAuthorityState,
+  readAuthorityStateForReplay,
+  releasePreparedChallenge,
+  reopenUnconfirmedChallenge,
+  requester,
+  validState,
+};
+
+if (require.main === module) {
+  (async () => {
+    const command = process.argv[2];
+    if (!['prepare', 'finalize', 'release'].includes(command)) {
+      throw new Error('Unsupported authority state command');
+    }
+    const { verifyAuthorityChallengeEnvelope } = require('./keepalive_challenge_due');
+    const repository = String(process.env.GITHUB_REPOSITORY || '').toLowerCase();
+    const prNumber = Number(process.env.AUTHORITY_PR_NUMBER || '');
+    const headSha = String(process.env.AUTHORITY_HEAD_SHA || '').toLowerCase();
+    const provider = String(process.env.AUTHORITY_PROVIDER || '').toLowerCase();
+    const claimJson = process.env.AUTHORITY_CHALLENGE_CLAIM;
+    const ownerAttempt = `${repository}:${process.env.GITHUB_RUN_ID || ''}:${process.env.GITHUB_RUN_ATTEMPT || ''}`;
+    const verified = verifyAuthorityChallengeEnvelope({
+      claimJson,
+      signingKey: process.env.AUTHORITY_CHALLENGE_SIGNING_KEY,
+      repository,
+      prNumber,
+      boundaryFingerprint: process.env.AUTHORITY_CHALLENGE_FINGERPRINT,
+      headSha,
+    });
+    if (!verified || !ATTEMPT.test(ownerAttempt) ||
+        process.env.GITHUB_EVENT_NAME !== 'workflow_dispatch' ||
+        process.env.GITHUB_ACTOR !== 'github-actions[bot]') {
+      process.stdout.write(JSON.stringify({ granted: false, reason: 'invalid-signed-challenge' }));
+      return;
+    }
+    const request = requester();
+    const pr = await request('GET', `/repos/${repository}/pulls/${prNumber}`);
+    const labels = new Set((pr?.labels || []).map((label) => String(label.name || '').toLowerCase()));
+    if (pr?.state !== 'open' || pr?.head?.sha !== headSha ||
+        !labels.has('agent:needs-attention') || labels.has('needs-human')) {
+      process.stdout.write(JSON.stringify({ granted: false, reason: 'challenge-pr-state-changed' }));
+      return;
+    }
+    const claim = JSON.parse(claimJson);
+    const options = {
+      request, repository, prNumber, claim: {
+        generation: claim.generation,
+        boundary_fingerprint: process.env.AUTHORITY_CHALLENGE_FINGERPRINT,
+        due_at: claim.due_at,
+        expires_at: claim.expires_at,
+        head_sha: claim.head_sha,
+        nonce: claim.nonce,
+        sweep_run_id: claim.sweep_run_id,
+        sweep_run_attempt: claim.sweep_run_attempt,
+      }, ownerAttempt, provider, headSha,
+    };
+    const result = command === 'prepare'
+      ? await prepareChallenge(options)
+      : command === 'finalize'
+        ? await finalizeChallenge(options)
+        : await releasePreparedChallenge(options);
+    process.stdout.write(JSON.stringify(result));
+  })().catch((error) => {
+    process.stderr.write(`Authority challenge unavailable: ${error.message}\n`);
+    process.stdout.write(JSON.stringify({ granted: false, reason: 'authority-state-unavailable' }));
+  });
+}
