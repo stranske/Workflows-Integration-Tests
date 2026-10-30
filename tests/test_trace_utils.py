@@ -48,8 +48,10 @@ class _VariadicWrapper:
 
     def __init__(self) -> None:
         self.inner: Any = _NoConfigRunnable()
+        self.attempts: list[dict[str, Any]] = []
 
     def invoke(self, payload: Any, **kwargs: Any) -> Any:
+        self.attempts.append(dict(kwargs))
         return self.inner.invoke(payload, **kwargs)
 
 
@@ -85,6 +87,18 @@ def _install_langsmith_helpers(
     )
 
 
+@pytest.fixture
+def no_provider_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every tools.llm_provider LangSmith helper fail, forcing trace_utils' fallbacks."""
+    from tools import llm_provider
+
+    def unavailable(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("LangSmith helper unavailable")
+
+    for name in ("build_langsmith_metadata", "extract_trace_id", "derive_langsmith_trace_url"):
+        monkeypatch.setattr(llm_provider, name, unavailable, False)
+
+
 def test_trace_info_available_and_as_dict() -> None:
     empty = TraceInfo()
     assert empty.available is False
@@ -105,7 +119,7 @@ def test_trace_info_available_and_as_dict() -> None:
     }
 
 
-def test_build_trace_config_falls_back_to_local_metadata() -> None:
+def test_build_trace_config_falls_back_to_local_metadata(no_provider_helpers: None) -> None:
     config = build_trace_config(operation="triage", pr_number=7, issue_number=None)
 
     assert config["metadata"] == {"operation": "triage", "pr_number": "7", "issue_number": None}
@@ -122,7 +136,7 @@ def test_build_trace_config_prefers_provider_helper(monkeypatch: pytest.MonkeyPa
     assert calls == [{"operation": "triage", "pr_number": 3, "issue_number": 4}]
 
 
-def test_extract_trace_info_without_provider_helpers_is_empty() -> None:
+def test_extract_trace_info_without_provider_helpers_is_empty(no_provider_helpers: None) -> None:
     info = extract_trace_info(_Response())
 
     assert info == TraceInfo()
@@ -170,7 +184,7 @@ def test_invoke_config_support_unknown_when_signature_unavailable(
     assert trace_utils._invoke_config_support(lambda payload: payload) == "unknown"
 
 
-def test_invoke_with_trace_passes_config_when_supported() -> None:
+def test_invoke_with_trace_passes_config_when_supported(no_provider_helpers: None) -> None:
     runnable = _ConfigRunnable()
 
     response, trace = invoke_with_trace(
@@ -203,11 +217,22 @@ def test_invoke_with_trace_retries_without_config_on_direct_call_rejection(
         raise TypeError("no signature")
 
     monkeypatch.setattr(trace_utils.inspect, "signature", broken_signature)
+    original = trace_utils._is_unsupported_config_error
+    rejections: list[bool] = []
+
+    def spy(exc: TypeError, *, allow_delegated: bool = False) -> bool:
+        verdict = original(exc, allow_delegated=allow_delegated)
+        rejections.append(verdict)
+        return verdict
+
+    monkeypatch.setattr(trace_utils, "_is_unsupported_config_error", spy)
     runnable = _NoConfigRunnable()
 
     response, _trace = invoke_with_trace(runnable, "payload", operation="op")
 
     assert response.content == "ok"
+    # The config= attempt was made and rejected before the payload-only retry succeeded.
+    assert rejections == [True]
     assert runnable.calls == ["payload"]
 
 
@@ -217,6 +242,8 @@ def test_invoke_with_trace_retries_delegated_variadic_wrapper() -> None:
     response, _trace = invoke_with_trace(wrapper, "payload", operation="op")
 
     assert response.content == "ok"
+    # First attempt carried config=, the retry did not; only the retry reached the inner runnable.
+    assert [sorted(attempt) for attempt in wrapper.attempts] == [["config"], []]
     assert wrapper.inner.calls == ["payload"]
 
 

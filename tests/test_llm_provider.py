@@ -141,7 +141,7 @@ def test_setup_langsmith_tracing_sets_defaults_but_respects_existing(
 
 def test_setup_langsmith_tracing_default_project_name(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LANGSMITH_API_KEY", "key")
-    _unset_env(monkeypatch, "LANGCHAIN_PROJECT")
+    _unset_env(monkeypatch, "LANGCHAIN_PROJECT", "LANGCHAIN_TRACING_V2")
 
     assert lp._setup_langsmith_tracing() is True
     assert lp.os.environ["LANGCHAIN_PROJECT"] == "workflows-agents"
