@@ -31,7 +31,12 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.coverage.run]
-omit = ["tests/*"]
+omit = [
+    "tests/*",
+    "tools/*",
+    "scripts/*",
+    ".github/scripts/*",
+]
 branch = true
 
 [tool.coverage.report]
