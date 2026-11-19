@@ -14,13 +14,14 @@ coverage==7.17.3
     #   pytest-cov
 iniconfig==2.3.1
     # via pytest
-librt==0.16.0 ; platform_python_implementation != 'PyPy'
+librt==0.17.0 ; platform_python_implementation != 'PyPy'
     # via mypy
 mypy==2.4.1
     # via workflows-integration (pyproject.toml)
 mypy-extensions==1.2.0
     # via
     #   black
+    #   librt
     #   mypy
 packaging==26.3
     # via
