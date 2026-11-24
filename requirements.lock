@@ -23,7 +23,7 @@ mypy-extensions==1.2.0
     #   black
     #   librt
     #   mypy
-packaging==26.3
+packaging==26.4
     # via
     #   black
     #   pytest
