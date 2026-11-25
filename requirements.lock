@@ -8,7 +8,7 @@ click==8.5.1
     # via black
 colorama==0.4.6 ; sys_platform == 'win32'
     # via pytest
-coverage==7.17.3
+coverage==7.17.4
     # via
     #   workflows-integration (pyproject.toml)
     #   pytest-cov
@@ -47,7 +47,7 @@ pytest-cov==7.1.0
     # via workflows-integration (pyproject.toml)
 pytokens==0.4.1
     # via black
-ruff==0.17.5
+ruff==0.17.6
     # via workflows-integration (pyproject.toml)
 typing-extensions==4.16.0
     # via mypy
