@@ -105,6 +105,7 @@ def _get_llm_client(force_openai: bool = False) -> tuple[object, str] | None:
     try:
         # Keep imports contiguous; consumer repos treat both as third-party
         from langchain_openai import ChatOpenAI  # noqa: I001
+
         from tools.llm_provider import DEFAULT_MODEL, GITHUB_MODELS_BASE_URL
     except ImportError:
         return None
