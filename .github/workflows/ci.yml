@@ -1,176 +1,137 @@
-name: CI (integration)
+# Cosmetic Repair Template
+#
+# Copy this file to your repo's .github/workflows/ directory.
+# This workflow auto-fixes cosmetic issues (formatting, docstrings) and opens a PR.
+#
+# Set the formatter paths below to match your project. This workflow installs
+# Black, isort, Ruff and docformatter on the runner.
+#
+# Note: This is a simplified version. For the full cosmetic repair system
+# with pytest failure classification, copy from stranske/Workflows.
+
+name: Cosmetic Repair
 
 on:
-  push:
-  pull_request:
-  schedule:
-    - cron: '15 4 * * *'
-  repository_dispatch:
-    types: [workflow-release]
   workflow_dispatch:
     inputs:
-      workflow_ref:
-        description: 'Workflow ref to test (e.g., @main, @v1, @v1.2.3)'
+      dry-run:
+        description: 'Preview changes without creating PR'
         required: false
-        default: '@main'
+        default: 'false'
+        type: boolean
+
+permissions:
+  contents: write
+  pull-requests: write
 
 jobs:
-  # Configuration 1: Basic - minimal settings, single Python version
-  basic:
-    name: Basic (3.14 only)
-    uses: stranske/Workflows/.github/workflows/reusable-10-ci-python.yml@main
-    with:
-      python-versions: '["3.14"]'
-      coverage: false
-      lint: true
-      format_check: true
-      typecheck: false
-      enable-metrics: false
-      enable-history: false
-      enable-coverage-delta: false
-      enable-soft-gate: false
-      artifact-prefix: basic-
-    secrets: inherit
-
-  # Configuration 2: Full coverage - all features enabled
-  full-coverage:
-    name: Full coverage (3.13, 3.14)
-    uses: stranske/Workflows/.github/workflows/reusable-10-ci-python.yml@main
-    with:
-      python-versions: '["3.13", "3.14"]'
-      coverage: true
-      lint: true
-      format_check: true
-      typecheck: true
-      run-mypy: true
-      enable-metrics: false
-      enable-history: false
-      enable-coverage-delta: false
-      enable-soft-gate: true
-      require-measured-coverage-trend: true
-      baseline-coverage: '80'
-      coverage-alert-drop: '2'
-      artifact-prefix: full-
-    secrets: inherit
-
-  # Configuration 3: Typecheck only - focused mypy validation
-  typecheck-only:
-    name: Typecheck only (3.14)
-    uses: stranske/Workflows/.github/workflows/reusable-10-ci-python.yml@main
-    with:
-      python-versions: '["3.14"]'
-      coverage: false
-      lint: false
-      format_check: false
-      typecheck: true
-      run-mypy: true
-      enable-metrics: false
-      enable-history: false
-      enable-coverage-delta: false
-      enable-soft-gate: false
-      artifact-prefix: typecheck-
-    secrets: inherit
-
-  notify-failure:
-    name: Report failure to Workflows
-    needs: [basic, full-coverage, typecheck-only]
-    if: ${{ failure() && github.event_name != 'pull_request' }}
+  repair:
+    name: Apply cosmetic fixes
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    env:
-      # Step `if:` cannot read the secrets context (GitHub rejects the whole file), so expose presence as env.
-      HAS_ACTIONS_BOT_PAT: ${{ secrets.ACTIONS_BOT_PAT != '' }}
     steps:
-      - name: Checkout retry helpers (Workflows)
-        if: ${{ env.HAS_ACTIONS_BOT_PAT == 'true' }}
+      - name: Checkout
         uses: actions/checkout@v7
         with:
-          repository: stranske/Workflows
-          path: workflows
-          fetch-depth: 1
-          sparse-checkout: |
-            .github/actions/setup-api-client
-            .github/scripts/github-api-with-retry.js
-            .github/scripts/token_load_balancer.js
-            .github/scripts/error_classifier.js
-            .github/scripts/github-rate-limited-wrapper.js
-          sparse-checkout-cone-mode: false
+          fetch-depth: 0
 
-      - name: Setup API client
-        if: ${{ env.HAS_ACTIONS_BOT_PAT == 'true' }}
-        uses: ./workflows/.github/actions/setup-api-client
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          # Pass only the secret this job uses: toJSON(secrets) handed to an action checked out
-          # from another repo makes GitHub hold the run as possibly malicious (action_required).
-          actions_bot_pat: ${{ secrets.ACTIONS_BOT_PAT }}
-          github_token: ${{ github.token }}
+          python-version: '3.14'
 
-      - name: Open issue in Workflows repo
-        if: ${{ env.HAS_ACTIONS_BOT_PAT == 'true' }}
-        uses: actions/github-script@v9
-        with:
-          github-token: ${{ secrets.ACTIONS_BOT_PAT }}
-          script: |
-            const { createTokenAwareRetry } = require(
-              './workflows/.github/scripts/github-api-with-retry.js'
-            );
-            const { withRetry } = await createTokenAwareRetry({
-              github,
-              core,
-              env: process.env,
-              task: 'integration-failure-report',
-            });
-            const title = `🔴 Integration CI failed (run ${context.runNumber})`;
-            const body = [
-              `## Integration Test Failure`,
-              ``,
-              `The [Workflows-Integration-Tests](https://github.com/${context.repo.owner}/Workflows-Integration-Tests) CI failed.`,
-              ``,
-              `| Field | Value |`,
-              `|-------|-------|`,
-              `| **Run ID** | [${context.runId}](https://github.com/${context.repo.owner}/Workflows-Integration-Tests/actions/runs/${context.runId}) |`,
-              `| **Trigger** | \`${context.eventName}\` |`,
-              `| **Branch** | \`${context.ref.replace('refs/heads/', '')}\` |`,
-              `| **Commit** | [\`${context.sha.slice(0, 7)}\`](https://github.com/${context.repo.owner}/Workflows-Integration-Tests/commit/${context.sha}) |`,
-              ``,
-              `### Next Steps`,
-              `1. Check the [failed run logs](https://github.com/${context.repo.owner}/Workflows-Integration-Tests/actions/runs/${context.runId})`,
-              `2. Identify if the failure is in the reusable workflow or the integration harness`,
-              `3. Fix and close this issue`,
-            ].join('\n');
+      - name: Install formatters
+        run: pip install black ruff isort docformatter
 
-            // Check for existing open issue to avoid duplicates
-            const { data: issues } = await withRetry(() => github.rest.issues.listForRepo({
-              owner: 'stranske',
-              repo: 'Workflows',
-              state: 'open',
-              labels: 'integration-failure',
-              per_page: 5
-            }));
+      # CUSTOMIZE: Update paths to match your project
+      - name: Apply Black formatting
+        run: black src/ tests/ scripts/
 
-            if (issues.length > 0) {
-              // Add comment to existing issue
-              await withRetry(() => github.rest.issues.createComment({
-                owner: 'stranske',
-                repo: 'Workflows',
-                issue_number: issues[0].number,
-                body: `Another failure detected:\n\n${body}`
-              }));
-              console.log(`Added comment to existing issue #${issues[0].number}`);
-            } else {
-              // Create new issue
-              const { data: issue } = await withRetry(() => github.rest.issues.create({
-                owner: 'stranske',
-                repo: 'Workflows',
-                title,
-                body,
-                labels: ['integration-failure', 'bug']
-              }));
-              console.log(`Created issue #${issue.number}`);
-            }
+      - name: Apply isort import sorting
+        run: isort src/ tests/ scripts/
 
-      - name: Skip failure notification (missing token)
-        if: ${{ env.HAS_ACTIONS_BOT_PAT != 'true' }}
+      - name: Apply Ruff fixes
         run: |
-          echo "::warning::ACTIONS_BOT_PAT not available, skipping failure notification"
+          diagnostics=$(mktemp)
+          trap 'rm -f "$diagnostics"' EXIT
+          status=0
+          ruff check --fix --output-format json src/ tests/ scripts/ > "$diagnostics" || status=$?
+          if [ "$status" -eq 1 ]; then
+            cat "$diagnostics"
+            # Ruff also returns 1 for unreadable files and syntax errors.
+            jq -se 'length == 1 and (.[0] | type == "array" and length > 0 and all(.[];
+              (.code | test("^[A-Z]+[0-9]+$")) and .code != "E902" and .code != "E999"
+            ))' "$diagnostics" > /dev/null || { echo "::error::Ruff could not check all files."; exit 1; }
+          else
+            exit "$status"
+          fi
+
+      - name: Apply docformatter
+        run: |
+          status=0
+          docformatter --in-place --recursive src/ || status=$?
+          # In-place mode returns 3 when it successfully rewrites files.
+          if [ "$status" -ne 3 ]; then exit "$status"; fi
+
+      - name: Check for changes
+        id: diff
+        run: |
+          if git diff --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No cosmetic fixes needed"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Cosmetic fixes applied:"
+            git diff --stat
+          fi
+
+      - name: Write pull request body
+        if: steps.diff.outputs.changed == 'true' && inputs.dry-run != true
+        run: |
+          set -euo pipefail
+          # Indent diff lines as Markdown code and bound the detail without splitting UTF-8.
+          {
+            cat <<'BODY'
+          ## Automated Cosmetic Repairs
+
+          This PR applies automated formatting and style fixes:
+          - Black formatting
+          - Import sorting (isort)
+          - Ruff auto-fixes
+          - Docstring formatting
+
+          **Files changed:**
+
+          BODY
+            git -c core.quotePath=true diff --no-ext-diff --no-textconv --name-only -- |
+              LC_ALL=C awk '
+                NR >= 101 || bytes + length($0) + 5 > 12000 { truncated = 1 }
+                !truncated { print "    " $0; bytes += length($0) + 5 }
+                END {
+                  if (truncated) print "    [Details truncated. See the pull request diff.]"
+                  if (!NR) print "    See diff for details"
+                }
+              '
+            cat <<'BODY'
+
+          ---
+          _Generated by cosmetic-repair workflow_
+          BODY
+          } > "$RUNNER_TEMP/cosmetic-repair-body.md"
+
+      - name: Create pull request
+        if: steps.diff.outputs.changed == 'true' && inputs.dry-run != true
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: 'style: apply cosmetic fixes'
+          title: 'style: automated cosmetic repairs'
+          body-path: ${{ runner.temp }}/cosmetic-repair-body.md
+          branch: style/cosmetic-repair-${{ github.run_number }}
+          delete-branch: true
+          labels: style, automated
+
+      - name: Show dry-run diff
+        if: inputs.dry-run == true && steps.diff.outputs.changed == 'true'
+        run: |
+          echo "## Dry Run - Changes that would be made:"
+          git diff
